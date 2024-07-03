@@ -17,6 +17,9 @@ h1, h2, h3, h4, p {
 }
 .make_bold {
     font-weight: bold;
+}
+.make_bold_with_padding {
+    font-weight: bold;
     padding-bottom: 10px;
 }
 .margin_bottom {
@@ -51,11 +54,24 @@ h1, h2, h3, h4, p {
     margin: 10px 0 10px 0;
     text-align: center;
 }
+.circle {
+    font-size: 15px;
+    color: black;
+    margin-left: 5px;
+    margin-right: 5px;
+}
+.container {
+    display: flex;
+}
+
+.box {
+    text-align: center;
+}
 </style>
 <body>
     <div id="header">
         <div id="address">
-            <p class="make_bold">
+            <p class="make_bold_with_padding">
 Flat 11, Bryce House,<br />
 John Williams Close,<br />
 London, SE14 5XG<br />
@@ -64,19 +80,19 @@ royhanley8@gmail.com<br />
         </div>
         <div id="name">
             <h1>Roy Hanley</h1>
-            <h4 class="make_bold">Computer Programmer Resume</h4>
+            <h4 class="make_bold_with_padding">Computer Programmer Resume</h4>
             <a href="https://royhanley.com">royhanley.com</a>
             <a href="https://github.com/royroy21">github.com/royroy21</a>
         </div>
     </div>
-    <p id="tag_line">React/Django programmer experienced in developing data driven applications</p>
+    <p id="tag_line">Python/Django/React programmer experienced in developing data driven applications</p>
     <div>
         <h2 class="margin_bottom">Technology Summary</h2>
-        <p class="make_bold">
+        <p class="make_bold_with_padding">
             Python, Django, JavaScript, React, React Native, Redux, Zustand, HTML, CSS,
             Linux, BASH, PostgreSQL, Docker, Ansible, Terraform, Nginx,
             GIT, REST, GraphQL, Vagrant, Celery, RabbitMQ, AWS, Heroku, CircleCI,
-            Airflow, timescaleDB.
+            Airflow, timescaleDB, Agile, Scrum.
         </p>
     </div>
     <div class="gray_break"></div>
@@ -89,6 +105,13 @@ royhanley8@gmail.com<br />
                 Leveraged Airflow and Django for ETL tasks, utilising TimescaleDB for time-based data management
                 and optimised database performance.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Airflow</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>timescaleDB</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>REST API integrations</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Working with an internation team</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4 class="margin_bottom">Full Stack Developer (10/2022-12/2023) GigPig (<a href="https://gigpig.fm/">gigpig.fm</a>)</h4>
@@ -96,6 +119,13 @@ royhanley8@gmail.com<br />
                 and Zustand for iOS/Android. Developed the backend using Python/Django and Django Channels,
                 incorporating Django REST Framework and Elasticsearch for search functionality.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Django channels</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>React Native</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>REST/DRF</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Elasticsearch</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4 class="margin_bottom">Django Developer (08/2020-02/2022) Octopus Energy (<a href="https://electroverse.octopus.energy/">electroverse.octopus</a>)</h4>
@@ -104,12 +134,26 @@ royhanley8@gmail.com<br />
                 Collaborated with iOS, Android, and web teams to create APIs. Assisted in hiring and mentoring
                 the backend team.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>GraphQL</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Heroku</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Team mentoring</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Agile</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4 class="margin_bottom">Full Stack Developer (03/2020-08/2020) Fix The News (<a href="https://staging.fixthenews.com/">fixthenews.com</a>)</h4>
             <p>Developed and maintained a news comparison website using Python/Django and React/Redux.
                 Implemented infrastructure as code with AWS, Terraform, and Ansible.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>React/Redux</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>AWS/Terraform</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Ansible</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Agile</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4 class="margin_bottom">Python Developer (04/2018-01/2020) Autotrip (<a href="https://autotrip.com/">autotrip.com</a>)</h4>
@@ -117,6 +161,13 @@ royhanley8@gmail.com<br />
                 Django. Contributed to developing the new React web app, eventually taking ownership. Created and
                 tested REST API endpoints for the React Native mobile app. Implemented infrastructure as code.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>React/Redux</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>AWS/Terraform</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Ansible</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Agile</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4>Python Developer (04/2015-04/2018) Ostmodern (<a href="https://www.ostmodern.co.uk/">ostmodern.co.uk</a>)</h4>
@@ -125,6 +176,14 @@ royhanley8@gmail.com<br />
                 the backend library for Ostmodern's applications. Designed and developed new features for BallBall.com,
                 BFI Player, and Olympic Player. Supported and upgraded existing products, and mentored junior developers.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>REST/DRF</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Javascript</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Postgres</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Linux/BASH</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Agile</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4 class="margin_bottom">Software and Database Developer (06/2012-03/2015) Thomas's London Day Schools (<a href="https://www.thomas-s.co.uk/">thomas-s.co.uk</a>)</h4>
@@ -134,6 +193,14 @@ royhanley8@gmail.com<br />
                 APIs to integrate external systems. Established new procedures for requirements gathering,
                 needs analysis, testing, scripting, and documentation to improve system quality and functionality.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python/Django</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>REST/DRF</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Postgres</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Javascript</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Linux/BASH</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Agile</p></div>
+            </div>
         </div>
         <div class="large_margin_bottom">
             <h4 class="margin_bottom">Python Programmer (10/2011-06/2012). Creative Virtual (<a href="https://www.creativevirtual.com/">creativevirtual.com</a>)</h4>
@@ -142,8 +209,12 @@ royhanley8@gmail.com<br />
                 functionalities using various backend and frontend technologies. Developed tools for data
                 analysis, data transfer, and testing.
             </p>
+            <div class="container make_bold">
+                <div class="box container"><span class="circle">&#9679;</span><p>Python</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>REST</p></div>
+                <div class="box container"><span class="circle">&#9679;</span><p>Agile</p></div>
+            </div>
         </div>
-        <br /><br /><br /><br /><br /><br /><br />
         <div>
             <p class="experience_note">Note: My work experience before this date include many contacted roles while I worked in engineering/management positions in construction. If needed a detailed breakdown of this work can be supplied</p>
         </div>
