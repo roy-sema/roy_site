@@ -1,4 +1,4 @@
-# My site!
+# My site
 
 Contains CV + space invaders game
 
