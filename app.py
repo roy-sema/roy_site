@@ -17,6 +17,10 @@ app = Flask(__name__)
 app.config.from_object(Config)
 Session(app)
 
+"""
+This is my app.
+"""
+
 
 @app.route("/")
 def home():
