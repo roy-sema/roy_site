@@ -1,5 +1,7 @@
 # My site!
 
+Sema test repo
+
 Contains CV + space invaders game
 
 ## to start locally:
