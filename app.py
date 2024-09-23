@@ -49,15 +49,4 @@ def success():
 
 @app.route("/download-cv")
 def cv():
-    pdf = pdfkit.from_string(
-        input=render_template("cv.html"),
-        output_path=False,
-        configuration=pdfkit.configuration(wkhtmltopdf="/usr/bin/wkhtmltopdf"),
-        options={"enable-local-file-access": ""},
-    )
-    response = make_response(pdf)
-    response.headers.update({
-        "Content-Type": "application/pdf",
-        "Content-Disposition": "attachment; filename=roy_hanley_cv.pdf",
-    })
-    return response
+   return render_template("player_success.html") 
