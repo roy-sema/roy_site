@@ -61,3 +61,37 @@ def cv():
         "Content-Disposition": "attachment; filename=roy_hanley_cv.pdf",
     })
     return response
+
+
+# Dummy Python script
+
+import random
+
+# Function to generate a random list of numbers
+def generate_random_numbers(count, start=1, end=100):
+    random_numbers = [random.randint(start, end) for _ in range(count)]
+    return random_numbers
+
+# Function to calculate the average of a list
+def calculate_average(numbers):
+    if len(numbers) == 0:
+        return 0
+    return sum(numbers) / len(numbers)
+
+# Function to find the maximum and minimum number in a list
+def find_min_max(numbers):
+    if not numbers:
+        return None, None
+    return min(numbers), max(numbers)
+
+# Dummy function to check if a number is even or odd
+def is_even(number):
+    return number % 2 == 0
+
+# Function to print whether each number is even or odd
+def print_even_odd(numbers):
+    for num in numbers:
+        if is_even(num):
+            print(f"{num} is even")
+        else:
+            print(f"{num} is odd")
