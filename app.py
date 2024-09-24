@@ -3,7 +3,7 @@ from os import environ
 import pdfkit
 import redis
 
-from flask import Flask, make_response, render_template, session
+from flask import Flask, make_response, render, render_template, session
 from flask_session import Session
 
 
@@ -22,6 +22,11 @@ Session(app)
 def home():
     session["games_failed"] = 0
     return render_template("home.html")
+
+
+@app.route("/test")
+def test():
+    return render("test")
 
 
 @app.route("/game")
