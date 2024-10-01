@@ -1,223 +1,274 @@
-"""
-Cache middleware. If enabled, each Django-powered page will be cached based on
-URL. The canonical way to enable cache middleware is to set
-``UpdateCacheMiddleware`` as your first piece of middleware, and
-``FetchFromCacheMiddleware`` as the last::
+import inspect
+import os
+from importlib import import_module
 
-    MIDDLEWARE = [
-        'django.middleware.cache.UpdateCacheMiddleware',
-        ...
-        'django.middleware.cache.FetchFromCacheMiddleware'
-    ]
+from django.core.exceptions import ImproperlyConfigured
+from django.utils.functional import cached_property
+from django.utils.module_loading import import_string, module_has_submodule
 
-This is counterintuitive, but correct: ``UpdateCacheMiddleware`` needs to run
-last during the response phase, which processes middleware bottom-up;
-``FetchFromCacheMiddleware`` needs to run last during the request phase, which
-processes middleware top-down.
-
-The single-class ``CacheMiddleware`` can be used for some simple sites.
-However, if any other piece of middleware needs to affect the cache key, you'll
-need to use the two-part ``UpdateCacheMiddleware`` and
-``FetchFromCacheMiddleware``. This'll most often happen when you're using
-Django's ``LocaleMiddleware``.
-
-More details about how the caching works:
-
-* Only GET or HEAD-requests with status code 200 are cached.
-
-* The number of seconds each page is stored for is set by the "max-age" section
-  of the response's "Cache-Control" header, falling back to the
-  CACHE_MIDDLEWARE_SECONDS setting if the section was not found.
-
-* This middleware expects that a HEAD request is answered with the same response
-  headers exactly like the corresponding GET request.
-
-* When a hit occurs, a shallow copy of the original response object is returned
-  from process_request.
-
-* Pages will be cached based on the contents of the request headers listed in
-  the response's "Vary" header.
-
-* This middleware also sets ETag, Last-Modified, Expires and Cache-Control
-  headers on the response object.
-
-"""
-
-import time
-
-from django.conf import settings
-from django.core.cache import DEFAULT_CACHE_ALIAS, caches
-from django.utils.cache import (
-    get_cache_key,
-    get_max_age,
-    has_vary_header,
-    learn_cache_key,
-    patch_response_headers,
-)
-from django.utils.deprecation import MiddlewareMixin
-from django.utils.http import parse_http_date_safe
+APPS_MODULE_NAME = "apps"
+MODELS_MODULE_NAME = "models"
 
 
-class UpdateCacheMiddleware(MiddlewareMixin):
-    """
-    Response-phase cache middleware that updates the cache if the response is
-    cacheable.
+class AppConfig:
+    """Class representing a Django application and its configuration."""
 
-    Must be used as part of the two-part update/fetch cache middleware.
-    UpdateCacheMiddleware must be the first piece of middleware in MIDDLEWARE
-    so that it'll get called last during the response phase.
-    """
+    def __init__(self, app_name, app_module):
+        # Full Python path to the application e.g. 'django.contrib.admin'.
+        self.name = app_name
 
-    def __init__(self, get_response):
-        super().__init__(get_response)
-        self.cache_timeout = settings.CACHE_MIDDLEWARE_SECONDS
-        self.page_timeout = None
-        self.key_prefix = settings.CACHE_MIDDLEWARE_KEY_PREFIX
-        self.cache_alias = settings.CACHE_MIDDLEWARE_ALIAS
+        # Root module for the application e.g. <module 'django.contrib.admin'
+        # from 'django/contrib/admin/__init__.py'>.
+        self.module = app_module
+
+        # Reference to the Apps registry that holds this AppConfig. Set by the
+        # registry when it registers the AppConfig instance.
+        self.apps = None
+
+        # The following attributes could be defined at the class level in a
+        # subclass, hence the test-and-set pattern.
+
+        # Last component of the Python path to the application e.g. 'admin'.
+        # This value must be unique across a Django project.
+        if not hasattr(self, "label"):
+            self.label = app_name.rpartition(".")[2]
+        if not self.label.isidentifier():
+            raise ImproperlyConfigured(
+                "The app label '%s' is not a valid Python identifier." % self.label
+            )
+
+        # Human-readable name for the application e.g. "Admin".
+        if not hasattr(self, "verbose_name"):
+            self.verbose_name = self.label.title()
+
+        # Filesystem path to the application directory e.g.
+        # '/path/to/django/contrib/admin'.
+        if not hasattr(self, "path"):
+            self.path = self._path_from_module(app_module)
+
+        # Module containing models e.g. <module 'django.contrib.admin.models'
+        # from 'django/contrib/admin/models.py'>. Set by import_models().
+        # None if the application doesn't have a models module.
+        self.models_module = None
+
+        # Mapping of lowercase model names to model classes. Initially set to
+        # None to prevent accidental access before import_models() runs.
+        self.models = None
+
+    def __repr__(self):
+        return "<%s: %s>" % (self.__class__.__name__, self.label)
+
+    @cached_property
+    def default_auto_field(self):
+        from django.conf import settings
+
+        return settings.DEFAULT_AUTO_FIELD
 
     @property
-    def cache(self):
-        return caches[self.cache_alias]
+    def _is_default_auto_field_overridden(self):
+        return self.__class__.default_auto_field is not AppConfig.default_auto_field
 
-    def _should_update_cache(self, request, response):
-        return hasattr(request, "_cache_update_cache") and request._cache_update_cache
-
-    def process_response(self, request, response):
-        """Set the cache, if needed."""
-        if not self._should_update_cache(request, response):
-            # We don't need to update the cache, just return.
-            return response
-
-        if response.streaming or response.status_code not in (200, 304):
-            return response
-
-        # Don't cache responses that set a user-specific (and maybe security
-        # sensitive) cookie in response to a cookie-less request.
-        if (
-            not request.COOKIES
-            and response.cookies
-            and has_vary_header(response, "Cookie")
-        ):
-            return response
-
-        # Don't cache a response with 'Cache-Control: private'
-        if "private" in response.get("Cache-Control", ()):
-            return response
-
-        # Page timeout takes precedence over the "max-age" and the default
-        # cache timeout.
-        timeout = self.page_timeout
-        if timeout is None:
-            # The timeout from the "max-age" section of the "Cache-Control"
-            # header takes precedence over the default cache timeout.
-            timeout = get_max_age(response)
-            if timeout is None:
-                timeout = self.cache_timeout
-            elif timeout == 0:
-                # max-age was set to 0, don't cache.
-                return response
-        patch_response_headers(response, timeout)
-        if timeout and response.status_code == 200:
-            cache_key = learn_cache_key(
-                request, response, timeout, self.key_prefix, cache=self.cache
-            )
-            if hasattr(response, "render") and callable(response.render):
-                response.add_post_render_callback(
-                    lambda r: self.cache.set(cache_key, r, timeout)
-                )
+    def _path_from_module(self, module):
+        """Attempt to determine app's filesystem path from its module."""
+        # See #21874 for extended discussion of the behavior of this method in
+        # various cases.
+        # Convert to list because __path__ may not support indexing.
+        paths = list(getattr(module, "__path__", []))
+        if len(paths) != 1:
+            filename = getattr(module, "__file__", None)
+            if filename is not None:
+                paths = [os.path.dirname(filename)]
             else:
-                self.cache.set(cache_key, response, timeout)
-        return response
-
-
-class FetchFromCacheMiddleware(MiddlewareMixin):
-    """
-    Request-phase cache middleware that fetches a page from the cache.
-
-    Must be used as part of the two-part update/fetch cache middleware.
-    FetchFromCacheMiddleware must be the last piece of middleware in MIDDLEWARE
-    so that it'll get called last during the request phase.
-    """
-
-    def __init__(self, get_response):
-        super().__init__(get_response)
-        self.key_prefix = settings.CACHE_MIDDLEWARE_KEY_PREFIX
-        self.cache_alias = settings.CACHE_MIDDLEWARE_ALIAS
-
-    @property
-    def cache(self):
-        return caches[self.cache_alias]
-
-    def process_request(self, request):
-        """
-        Check whether the page is already cached and return the cached
-        version if available.
-        """
-        if request.method not in ("GET", "HEAD"):
-            request._cache_update_cache = False
-            return None  # Don't bother checking the cache.
-
-        # try and get the cached GET response
-        cache_key = get_cache_key(request, self.key_prefix, "GET", cache=self.cache)
-        if cache_key is None:
-            request._cache_update_cache = True
-            return None  # No cache information available, need to rebuild.
-        response = self.cache.get(cache_key)
-        # if it wasn't found and we are looking for a HEAD, try looking just for that
-        if response is None and request.method == "HEAD":
-            cache_key = get_cache_key(
-                request, self.key_prefix, "HEAD", cache=self.cache
+                # For unknown reasons, sometimes the list returned by __path__
+                # contains duplicates that must be removed (#25246).
+                paths = list(set(paths))
+        if len(paths) > 1:
+            raise ImproperlyConfigured(
+                "The app module %r has multiple filesystem locations (%r); "
+                "you must configure this app with an AppConfig subclass "
+                "with a 'path' class attribute." % (module, paths)
             )
-            response = self.cache.get(cache_key)
+        elif not paths:
+            raise ImproperlyConfigured(
+                "The app module %r has no filesystem location, "
+                "you must configure this app with an AppConfig subclass "
+                "with a 'path' class attribute." % module
+            )
+        return paths[0]
 
-        if response is None:
-            request._cache_update_cache = True
-            return None  # No cache information available, need to rebuild.
+    @classmethod
+    def create(cls, entry):
+        """
+        Factory that creates an app config from an entry in INSTALLED_APPS.
+        """
+        # create() eventually returns app_config_class(app_name, app_module).
+        app_config_class = None
+        app_name = None
+        app_module = None
 
-        # Derive the age estimation of the cached response.
-        if (max_age_seconds := get_max_age(response)) is not None and (
-            expires_timestamp := parse_http_date_safe(response["Expires"])
-        ) is not None:
-            now_timestamp = int(time.time())
-            remaining_seconds = expires_timestamp - now_timestamp
-            # Use Age: 0 if local clock got turned back.
-            response["Age"] = max(0, max_age_seconds - remaining_seconds)
-
-        # hit, return cached response
-        request._cache_update_cache = False
-        return response
-
-
-class CacheMiddleware(UpdateCacheMiddleware, FetchFromCacheMiddleware):
-    """
-    Cache middleware that provides basic behavior for many simple sites.
-
-    Also used as the hook point for the cache decorator, which is generated
-    using the decorator-from-middleware utility.
-    """
-
-    def __init__(self, get_response, cache_timeout=None, page_timeout=None, **kwargs):
-        super().__init__(get_response)
-        # We need to differentiate between "provided, but using default value",
-        # and "not provided". If the value is provided using a default, then
-        # we fall back to system defaults. If it is not provided at all,
-        # we need to use middleware defaults.
-
+        # If import_module succeeds, entry points to the app module.
         try:
-            key_prefix = kwargs["key_prefix"]
-            if key_prefix is None:
-                key_prefix = ""
-            self.key_prefix = key_prefix
-        except KeyError:
+            app_module = import_module(entry)
+        except Exception:
             pass
-        try:
-            cache_alias = kwargs["cache_alias"]
-            if cache_alias is None:
-                cache_alias = DEFAULT_CACHE_ALIAS
-            self.cache_alias = cache_alias
-        except KeyError:
-            pass
+        else:
+            # If app_module has an apps submodule that defines a single
+            # AppConfig subclass, use it automatically.
+            # To prevent this, an AppConfig subclass can declare a class
+            # variable default = False.
+            # If the apps module defines more than one AppConfig subclass,
+            # the default one can declare default = True.
+            if module_has_submodule(app_module, APPS_MODULE_NAME):
+                mod_path = "%s.%s" % (entry, APPS_MODULE_NAME)
+                mod = import_module(mod_path)
+                # Check if there's exactly one AppConfig candidate,
+                # excluding those that explicitly define default = False.
+                app_configs = [
+                    (name, candidate)
+                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
+                    if (
+                        issubclass(candidate, cls)
+                        and candidate is not cls
+                        and getattr(candidate, "default", True)
+                    )
+                ]
+                if len(app_configs) == 1:
+                    app_config_class = app_configs[0][1]
+                else:
+                    # Check if there's exactly one AppConfig subclass,
+                    # among those that explicitly define default = True.
+                    app_configs = [
+                        (name, candidate)
+                        for name, candidate in app_configs
+                        if getattr(candidate, "default", False)
+                    ]
+                    if len(app_configs) > 1:
+                        candidates = [repr(name) for name, _ in app_configs]
+                        raise RuntimeError(
+                            "%r declares more than one default AppConfig: "
+                            "%s." % (mod_path, ", ".join(candidates))
+                        )
+                    elif len(app_configs) == 1:
+                        app_config_class = app_configs[0][1]
 
-        if cache_timeout is not None:
-            self.cache_timeout = cache_timeout
-        self.page_timeout = page_timeout
+            # Use the default app config class if we didn't find anything.
+            if app_config_class is None:
+                app_config_class = cls
+                app_name = entry
+
+        # If import_string succeeds, entry is an app config class.
+        if app_config_class is None:
+            try:
+                app_config_class = import_string(entry)
+            except Exception:
+                pass
+        # If both import_module and import_string failed, it means that entry
+        # doesn't have a valid value.
+        if app_module is None and app_config_class is None:
+            # If the last component of entry starts with an uppercase letter,
+            # then it was likely intended to be an app config class; if not,
+            # an app module. Provide a nice error message in both cases.
+            mod_path, _, cls_name = entry.rpartition(".")
+            if mod_path and cls_name[0].isupper():
+                # We could simply re-trigger the string import exception, but
+                # we're going the extra mile and providing a better error
+                # message for typos in INSTALLED_APPS.
+                # This may raise ImportError, which is the best exception
+                # possible if the module at mod_path cannot be imported.
+                mod = import_module(mod_path)
+                candidates = [
+                    repr(name)
+                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
+                    if issubclass(candidate, cls) and candidate is not cls
+                ]
+                msg = "Module '%s' does not contain a '%s' class." % (
+                    mod_path,
+                    cls_name,
+                )
+                if candidates:
+                    msg += " Choices are: %s." % ", ".join(candidates)
+                raise ImportError(msg)
+            else:
+                # Re-trigger the module import exception.
+                import_module(entry)
+
+        # Check for obvious errors. (This check prevents duck typing, but
+        # it could be removed if it became a problem in practice.)
+        if not issubclass(app_config_class, AppConfig):
+            raise ImproperlyConfigured("'%s' isn't a subclass of AppConfig." % entry)
+
+        # Obtain app name here rather than in AppClass.__init__ to keep
+        # all error checking for entries in INSTALLED_APPS in one place.
+        if app_name is None:
+            try:
+                app_name = app_config_class.name
+            except AttributeError:
+                raise ImproperlyConfigured("'%s' must supply a name attribute." % entry)
+
+        # Ensure app_name points to a valid module.
+        try:
+            app_module = import_module(app_name)
+        except ImportError:
+            raise ImproperlyConfigured(
+                "Cannot import '%s'. Check that '%s.%s.name' is correct."
+                % (
+                    app_name,
+                    app_config_class.__module__,
+                    app_config_class.__qualname__,
+                )
+            )
+
+        # Entry is a path to an app config class.
+        return app_config_class(app_name, app_module)
+
+    def get_model(self, model_name, require_ready=True):
+        """
+        Return the model with the given case-insensitive model_name.
+
+        Raise LookupError if no model exists with this name.
+        """
+        if require_ready:
+            self.apps.check_models_ready()
+        else:
+            self.apps.check_apps_ready()
+        try:
+            return self.models[model_name.lower()]
+        except KeyError:
+            raise LookupError(
+                "App '%s' doesn't have a '%s' model." % (self.label, model_name)
+            )
+
+    def get_models(self, include_auto_created=False, include_swapped=False):
+        """
+        Return an iterable of models.
+
+        By default, the following models aren't included:
+
+        - auto-created models for many-to-many relations without
+          an explicit intermediate table,
+        - models that have been swapped out.
+
+        Set the corresponding keyword argument to True to include such models.
+        Keyword arguments aren't documented; they're a private API.
+        """
+        self.apps.check_models_ready()
+        for model in self.models.values():
+            if model._meta.auto_created and not include_auto_created:
+                continue
+            if model._meta.swapped and not include_swapped:
+                continue
+            yield model
+
+    def import_models(self):
+        # Dictionary of models for this app, primarily maintained in the
+        # 'all_models' attribute of the Apps this AppConfig is attached to.
+        self.models = self.apps.all_models[self.label]
+
+        if module_has_submodule(self.module, MODELS_MODULE_NAME):
+            models_module_name = "%s.%s" % (self.name, MODELS_MODULE_NAME)
+            self.models_module = import_module(models_module_name)
+
+    def ready(self):
+        """
+        Override this method in subclasses to run code when Django starts.
+        """
