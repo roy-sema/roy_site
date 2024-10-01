@@ -1,191 +1,274 @@
+import inspect
+import os
+from importlib import import_module
 
-"""
-This module collects helper functions and classes that "span" multiple levels
-of MVC. In other words, these functions/classes introduce controlled coupling
-for convenience's sake.
-"""
+from django.core.exceptions import ImproperlyConfigured
+from django.utils.functional import cached_property
+from django.utils.module_loading import import_string, module_has_submodule
 
-from django.http import (
-    Http404,
-    HttpResponse,
-    HttpResponsePermanentRedirect,
-    HttpResponseRedirect,
-)
-from django.template import loader
-from django.urls import NoReverseMatch, reverse
-from django.utils.functional import Promise
+APPS_MODULE_NAME = "apps"
+MODELS_MODULE_NAME = "models"
 
 
-def render(
-    request, template_name, context=None, content_type=None, status=None, using=None
-):
-    """
-    Return an HttpResponse whose content is filled with the result of calling
-    django.template.loader.render_to_string() with the passed arguments.
-    """
-    content = loader.render_to_string(template_name, context, request, using=using)
-    return HttpResponse(content, content_type, status)
+class AppConfig:
+    """Class representing a Django application and its configuration."""
 
+    def __init__(self, app_name, app_module):
+        # Full Python path to the application e.g. 'django.contrib.admin'.
+        self.name = app_name
 
-def redirect(to, *args, permanent=False, **kwargs):
-    """
-    Return an HttpResponseRedirect to the appropriate URL for the arguments
-    passed.
+        # Root module for the application e.g. <module 'django.contrib.admin'
+        # from 'django/contrib/admin/__init__.py'>.
+        self.module = app_module
 
-    The arguments could be:
+        # Reference to the Apps registry that holds this AppConfig. Set by the
+        # registry when it registers the AppConfig instance.
+        self.apps = None
 
-        * A model: the model's `get_absolute_url()` function will be called.
+        # The following attributes could be defined at the class level in a
+        # subclass, hence the test-and-set pattern.
 
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
+        # Last component of the Python path to the application e.g. 'admin'.
+        # This value must be unique across a Django project.
+        if not hasattr(self, "label"):
+            self.label = app_name.rpartition(".")[2]
+        if not self.label.isidentifier():
+            raise ImproperlyConfigured(
+                "The app label '%s' is not a valid Python identifier." % self.label
+            )
 
-        * A URL, which will be used as-is for the redirect location.
+        # Human-readable name for the application e.g. "Admin".
+        if not hasattr(self, "verbose_name"):
+            self.verbose_name = self.label.title()
 
-    Issues a temporary redirect by default; pass permanent=True to issue a
-    permanent redirect.
-    """
-    redirect_class = (
-        HttpResponsePermanentRedirect if permanent else HttpResponseRedirect
-    )
-    return redirect_class(resolve_url(to, *args, **kwargs))
+        # Filesystem path to the application directory e.g.
+        # '/path/to/django/contrib/admin'.
+        if not hasattr(self, "path"):
+            self.path = self._path_from_module(app_module)
 
+        # Module containing models e.g. <module 'django.contrib.admin.models'
+        # from 'django/contrib/admin/models.py'>. Set by import_models().
+        # None if the application doesn't have a models module.
+        self.models_module = None
 
-def _get_queryset(klass):
-    """
-    Return a QuerySet or a Manager.
-    Duck typing in action: any class with a `get()` method (for
-    get_object_or_404) or a `filter()` method (for get_list_or_404) might do
-    the job.
-    """
-    # If it is a model class or anything else with ._default_manager
-    if hasattr(klass, "_default_manager"):
-        return klass._default_manager.all()
-    return klass
+        # Mapping of lowercase model names to model classes. Initially set to
+        # None to prevent accidental access before import_models() runs.
+        self.models = None
 
+    def __repr__(self):
+        return "<%s: %s>" % (self.__class__.__name__, self.label)
 
-def get_object_or_404(klass, *args, **kwargs):
-    """
-    Use get() to return an object, or raise an Http404 exception if the object
-    does not exist.
+    @cached_property
+    def default_auto_field(self):
+        from django.conf import settings
 
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the get() query.
+        return settings.DEFAULT_AUTO_FIELD
 
-    Like with QuerySet.get(), MultipleObjectsReturned is raised if more than
-    one object is found.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "get"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_object_or_404() must be a Model, Manager, "
-            "or QuerySet, not '%s'." % klass__name
-        )
-    try:
-        return queryset.get(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
+    @property
+    def _is_default_auto_field_overridden(self):
+        return self.__class__.default_auto_field is not AppConfig.default_auto_field
 
+    def _path_from_module(self, module):
+        """Attempt to determine app's filesystem path from its module."""
+        # See #21874 for extended discussion of the behavior of this method in
+        # various cases.
+        # Convert to list because __path__ may not support indexing.
+        paths = list(getattr(module, "__path__", []))
+        if len(paths) != 1:
+            filename = getattr(module, "__file__", None)
+            if filename is not None:
+                paths = [os.path.dirname(filename)]
+            else:
+                # For unknown reasons, sometimes the list returned by __path__
+                # contains duplicates that must be removed (#25246).
+                paths = list(set(paths))
+        if len(paths) > 1:
+            raise ImproperlyConfigured(
+                "The app module %r has multiple filesystem locations (%r); "
+                "you must configure this app with an AppConfig subclass "
+                "with a 'path' class attribute." % (module, paths)
+            )
+        elif not paths:
+            raise ImproperlyConfigured(
+                "The app module %r has no filesystem location, "
+                "you must configure this app with an AppConfig subclass "
+                "with a 'path' class attribute." % module
+            )
+        return paths[0]
 
-async def aget_object_or_404(klass, *args, **kwargs):
-    """See get_object_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "aget"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_object_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    try:
-        return await queryset.aget(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
+    @classmethod
+    def create(cls, entry):
+        """
+        Factory that creates an app config from an entry in INSTALLED_APPS.
+        """
+        # create() eventually returns app_config_class(app_name, app_module).
+        app_config_class = None
+        app_name = None
+        app_module = None
 
+        # If import_module succeeds, entry points to the app module.
+        try:
+            app_module = import_module(entry)
+        except Exception:
+            pass
+        else:
+            # If app_module has an apps submodule that defines a single
+            # AppConfig subclass, use it automatically.
+            # To prevent this, an AppConfig subclass can declare a class
+            # variable default = False.
+            # If the apps module defines more than one AppConfig subclass,
+            # the default one can declare default = True.
+            if module_has_submodule(app_module, APPS_MODULE_NAME):
+                mod_path = "%s.%s" % (entry, APPS_MODULE_NAME)
+                mod = import_module(mod_path)
+                # Check if there's exactly one AppConfig candidate,
+                # excluding those that explicitly define default = False.
+                app_configs = [
+                    (name, candidate)
+                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
+                    if (
+                        issubclass(candidate, cls)
+                        and candidate is not cls
+                        and getattr(candidate, "default", True)
+                    )
+                ]
+                if len(app_configs) == 1:
+                    app_config_class = app_configs[0][1]
+                else:
+                    # Check if there's exactly one AppConfig subclass,
+                    # among those that explicitly define default = True.
+                    app_configs = [
+                        (name, candidate)
+                        for name, candidate in app_configs
+                        if getattr(candidate, "default", False)
+                    ]
+                    if len(app_configs) > 1:
+                        candidates = [repr(name) for name, _ in app_configs]
+                        raise RuntimeError(
+                            "%r declares more than one default AppConfig: "
+                            "%s." % (mod_path, ", ".join(candidates))
+                        )
+                    elif len(app_configs) == 1:
+                        app_config_class = app_configs[0][1]
 
-def get_list_or_404(klass, *args, **kwargs):
-    """
-    Use filter() to return a list of objects, or raise an Http404 exception if
-    the list is empty.
+            # Use the default app config class if we didn't find anything.
+            if app_config_class is None:
+                app_config_class = cls
+                app_name = entry
 
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the filter() query.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_list_or_404() must be a Model, Manager, or "
-            "QuerySet, not '%s'." % klass__name
-        )
-    obj_list = list(queryset.filter(*args, **kwargs))
-    if not obj_list:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-    return obj_list
+        # If import_string succeeds, entry is an app config class.
+        if app_config_class is None:
+            try:
+                app_config_class = import_string(entry)
+            except Exception:
+                pass
+        # If both import_module and import_string failed, it means that entry
+        # doesn't have a valid value.
+        if app_module is None and app_config_class is None:
+            # If the last component of entry starts with an uppercase letter,
+            # then it was likely intended to be an app config class; if not,
+            # an app module. Provide a nice error message in both cases.
+            mod_path, _, cls_name = entry.rpartition(".")
+            if mod_path and cls_name[0].isupper():
+                # We could simply re-trigger the string import exception, but
+                # we're going the extra mile and providing a better error
+                # message for typos in INSTALLED_APPS.
+                # This may raise ImportError, which is the best exception
+                # possible if the module at mod_path cannot be imported.
+                mod = import_module(mod_path)
+                candidates = [
+                    repr(name)
+                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
+                    if issubclass(candidate, cls) and candidate is not cls
+                ]
+                msg = "Module '%s' does not contain a '%s' class." % (
+                    mod_path,
+                    cls_name,
+                )
+                if candidates:
+                    msg += " Choices are: %s." % ", ".join(candidates)
+                raise ImportError(msg)
+            else:
+                # Re-trigger the module import exception.
+                import_module(entry)
 
+        # Check for obvious errors. (This check prevents duck typing, but
+        # it could be removed if it became a problem in practice.)
+        if not issubclass(app_config_class, AppConfig):
+            raise ImproperlyConfigured("'%s' isn't a subclass of AppConfig." % entry)
 
-async def aget_list_or_404(klass, *args, **kwargs):
-    """See get_list_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_list_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    obj_list = [obj async for obj in queryset.filter(*args, **kwargs)]
-    if not obj_list:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-    return obj_list
+        # Obtain app name here rather than in AppClass.__init__ to keep
+        # all error checking for entries in INSTALLED_APPS in one place.
+        if app_name is None:
+            try:
+                app_name = app_config_class.name
+            except AttributeError:
+                raise ImproperlyConfigured("'%s' must supply a name attribute." % entry)
 
+        # Ensure app_name points to a valid module.
+        try:
+            app_module = import_module(app_name)
+        except ImportError:
+            raise ImproperlyConfigured(
+                "Cannot import '%s'. Check that '%s.%s.name' is correct."
+                % (
+                    app_name,
+                    app_config_class.__module__,
+                    app_config_class.__qualname__,
+                )
+            )
 
-def resolve_url(to, *args, **kwargs):
-    """
-    Return a URL appropriate for the arguments passed.
+        # Entry is a path to an app config class.
+        return app_config_class(app_name, app_module)
 
-    The arguments could be:
+    def get_model(self, model_name, require_ready=True):
+        """
+        Return the model with the given case-insensitive model_name.
 
-        * A model: the model's `get_absolute_url()` function will be called.
+        Raise LookupError if no model exists with this name.
+        """
+        if require_ready:
+            self.apps.check_models_ready()
+        else:
+            self.apps.check_apps_ready()
+        try:
+            return self.models[model_name.lower()]
+        except KeyError:
+            raise LookupError(
+                "App '%s' doesn't have a '%s' model." % (self.label, model_name)
+            )
 
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
+    def get_models(self, include_auto_created=False, include_swapped=False):
+        """
+        Return an iterable of models.
 
-        * A URL, which will be returned as-is.
-    """
-    # If it's a model, use get_absolute_url()
-    if hasattr(to, "get_absolute_url"):
-        return to.get_absolute_url()
+        By default, the following models aren't included:
 
-    if isinstance(to, Promise):
-        # Expand the lazy instance, as it can cause issues when it is passed
-        # further to some Python functions like urlparse.
-        to = str(to)
+        - auto-created models for many-to-many relations without
+          an explicit intermediate table,
+        - models that have been swapped out.
 
-    # Handle relative URLs
-    if isinstance(to, str) and to.startswith(("./", "../")):
-        return to
+        Set the corresponding keyword argument to True to include such models.
+        Keyword arguments aren't documented; they're a private API.
+        """
+        self.apps.check_models_ready()
+        for model in self.models.values():
+            if model._meta.auto_created and not include_auto_created:
+                continue
+            if model._meta.swapped and not include_swapped:
+                continue
+            yield model
 
-    # Next try a reverse URL resolution.
-    try:
-        return reverse(to, args=args, kwargs=kwargs)
-    except NoReverseMatch:
-        # If this is a callable, re-raise.
-        if callable(to):
-            raise
-        # If this doesn't "feel" like a URL, re-raise.
-        if "/" not in to and "." not in to:
-            raise
+    def import_models(self):
+        # Dictionary of models for this app, primarily maintained in the
+        # 'all_models' attribute of the Apps this AppConfig is attached to.
+        self.models = self.apps.all_models[self.label]
 
-    # Finally, fall back and assume it's a URL
-    return to
+        if module_has_submodule(self.module, MODELS_MODULE_NAME):
+            models_module_name = "%s.%s" % (self.name, MODELS_MODULE_NAME)
+            self.models_module = import_module(models_module_name)
+
+    def ready(self):
+        """
+        Override this method in subclasses to run code when Django starts.
+        """
