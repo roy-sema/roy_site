@@ -1,191 +1,327 @@
 
-"""
-This module collects helper functions and classes that "span" multiple levels
-of MVC. In other words, these functions/classes introduce controlled coupling
-for convenience's sake.
-"""
+import re
 
-from django.http import (
-    Http404,
-    HttpResponse,
-    HttpResponsePermanentRedirect,
-    HttpResponseRedirect,
-)
+from django import template
 from django.template import loader
 from django.urls import NoReverseMatch, reverse
-from django.utils.functional import Promise
+from django.utils.encoding import iri_to_uri
+from django.utils.html import escape, format_html, smart_urlquote
+from django.utils.safestring import mark_safe
+
+from rest_framework.compat import apply_markdown, pygments_highlight
+from rest_framework.renderers import HTMLFormRenderer
+from rest_framework.utils.urls import replace_query_param
+
+register = template.Library()
+
+# Regex for adding classes to html snippets
+class_re = re.compile(r'(?<=class=["\'])(.*)(?=["\'])')
 
 
-def render(
-    request, template_name, context=None, content_type=None, status=None, using=None
-):
+@register.tag(name='code')
+def highlight_code(parser, token):
+    code = token.split_contents()[-1]
+    nodelist = parser.parse(('endcode',))
+    parser.delete_first_token()
+    return CodeNode(code, nodelist)
+
+
+class CodeNode(template.Node):
+    style = 'emacs'
+
+    def __init__(self, lang, code):
+        self.lang = lang
+        self.nodelist = code
+
+    def render(self, context):
+        text = self.nodelist.render(context)
+        return pygments_highlight(text, self.lang, self.style)
+
+
+@register.filter()
+def with_location(fields, location):
+    return [
+        field for field in fields
+        if field.location == location
+    ]
+
+
+@register.simple_tag
+def form_for_link(link):
+    import coreschema
+    properties = {
+        field.name: field.schema or coreschema.String()
+        for field in link.fields
+    }
+    required = [
+        field.name
+        for field in link.fields
+        if field.required
+    ]
+    schema = coreschema.Object(properties=properties, required=required)
+    return mark_safe(coreschema.render_to_form(schema))
+
+
+@register.simple_tag
+def render_markdown(markdown_text):
+    if apply_markdown is None:
+        return markdown_text
+    return mark_safe(apply_markdown(markdown_text))
+
+
+@register.simple_tag
+def get_pagination_html(pager):
+    return pager.to_html()
+
+
+@register.simple_tag
+def render_form(serializer, template_pack=None):
+    style = {'template_pack': template_pack} if template_pack else {}
+    renderer = HTMLFormRenderer()
+    return renderer.render(serializer.data, None, {'style': style})
+
+
+@register.simple_tag
+def render_field(field, style):
+    renderer = style.get('renderer', HTMLFormRenderer())
+    return renderer.render_field(field, style)
+
+
+@register.simple_tag
+def optional_login(request):
     """
-    Return an HttpResponse whose content is filled with the result of calling
-    django.template.loader.render_to_string() with the passed arguments.
+    Include a login snippet if REST framework's login view is in the URLconf.
     """
-    content = loader.render_to_string(template_name, context, request, using=using)
-    return HttpResponse(content, content_type, status)
-
-
-def redirect(to, *args, permanent=False, **kwargs):
-    """
-    Return an HttpResponseRedirect to the appropriate URL for the arguments
-    passed.
-
-    The arguments could be:
-
-        * A model: the model's `get_absolute_url()` function will be called.
-
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
-
-        * A URL, which will be used as-is for the redirect location.
-
-    Issues a temporary redirect by default; pass permanent=True to issue a
-    permanent redirect.
-    """
-    redirect_class = (
-        HttpResponsePermanentRedirect if permanent else HttpResponseRedirect
-    )
-    return redirect_class(resolve_url(to, *args, **kwargs))
-
-
-def _get_queryset(klass):
-    """
-    Return a QuerySet or a Manager.
-    Duck typing in action: any class with a `get()` method (for
-    get_object_or_404) or a `filter()` method (for get_list_or_404) might do
-    the job.
-    """
-    # If it is a model class or anything else with ._default_manager
-    if hasattr(klass, "_default_manager"):
-        return klass._default_manager.all()
-    return klass
-
-
-def get_object_or_404(klass, *args, **kwargs):
-    """
-    Use get() to return an object, or raise an Http404 exception if the object
-    does not exist.
-
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the get() query.
-
-    Like with QuerySet.get(), MultipleObjectsReturned is raised if more than
-    one object is found.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "get"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_object_or_404() must be a Model, Manager, "
-            "or QuerySet, not '%s'." % klass__name
-        )
     try:
-        return queryset.get(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-
-
-async def aget_object_or_404(klass, *args, **kwargs):
-    """See get_object_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "aget"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_object_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    try:
-        return await queryset.aget(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-
-
-def get_list_or_404(klass, *args, **kwargs):
-    """
-    Use filter() to return a list of objects, or raise an Http404 exception if
-    the list is empty.
-
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the filter() query.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_list_or_404() must be a Model, Manager, or "
-            "QuerySet, not '%s'." % klass__name
-        )
-    obj_list = list(queryset.filter(*args, **kwargs))
-    if not obj_list:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-    return obj_list
-
-
-async def aget_list_or_404(klass, *args, **kwargs):
-    """See get_list_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_list_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    obj_list = [obj async for obj in queryset.filter(*args, **kwargs)]
-    if not obj_list:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-    return obj_list
-
-
-def resolve_url(to, *args, **kwargs):
-    """
-    Return a URL appropriate for the arguments passed.
-
-    The arguments could be:
-
-        * A model: the model's `get_absolute_url()` function will be called.
-
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
-
-        * A URL, which will be returned as-is.
-    """
-    # If it's a model, use get_absolute_url()
-    if hasattr(to, "get_absolute_url"):
-        return to.get_absolute_url()
-
-    if isinstance(to, Promise):
-        # Expand the lazy instance, as it can cause issues when it is passed
-        # further to some Python functions like urlparse.
-        to = str(to)
-
-    # Handle relative URLs
-    if isinstance(to, str) and to.startswith(("./", "../")):
-        return to
-
-    # Next try a reverse URL resolution.
-    try:
-        return reverse(to, args=args, kwargs=kwargs)
+        login_url = reverse('rest_framework:login')
     except NoReverseMatch:
-        # If this is a callable, re-raise.
-        if callable(to):
-            raise
-        # If this doesn't "feel" like a URL, re-raise.
-        if "/" not in to and "." not in to:
-            raise
+        return ''
 
-    # Finally, fall back and assume it's a URL
-    return to
+    snippet = "<li><a href='{href}?next={next}'>Log in</a></li>"
+    snippet = format_html(snippet, href=login_url, next=escape(request.path))
+
+    return mark_safe(snippet)
+
+
+@register.simple_tag
+def optional_docs_login(request):
+    """
+    Include a login snippet if REST framework's login view is in the URLconf.
+    """
+    try:
+        login_url = reverse('rest_framework:login')
+    except NoReverseMatch:
+        return 'log in'
+
+    snippet = "<a href='{href}?next={next}'>log in</a>"
+    snippet = format_html(snippet, href=login_url, next=escape(request.path))
+
+    return mark_safe(snippet)
+
+
+@register.simple_tag
+def optional_logout(request, user, csrf_token):
+    """
+    Include a logout snippet if REST framework's logout view is in the URLconf.
+    """
+    try:
+        logout_url = reverse('rest_framework:logout')
+    except NoReverseMatch:
+        snippet = format_html('<li class="navbar-text">{user}</li>', user=escape(user))
+        return mark_safe(snippet)
+
+    snippet = """<li class="dropdown">
+        <a href="#" class="dropdown-toggle" data-toggle="dropdown">
+            {user}
+            <b class="caret"></b>
+        </a>
+        <ul class="dropdown-menu">
+            <form id="logoutForm" method="post" action="{href}?next={next}">
+                <input type="hidden" name="csrfmiddlewaretoken" value="{csrf_token}">
+            </form>
+            <li>
+                <a href="#" onclick='document.getElementById("logoutForm").submit()'>Log out</a>
+            </li>
+        </ul>
+    </li>"""
+    snippet = format_html(snippet, user=escape(user), href=logout_url,
+                          next=escape(request.path), csrf_token=csrf_token)
+    return mark_safe(snippet)
+
+
+@register.simple_tag
+def add_query_param(request, key, val):
+    """
+    Add a query parameter to the current request url, and return the new url.
+    """
+    iri = request.get_full_path()
+    uri = iri_to_uri(iri)
+    return escape(replace_query_param(uri, key, val))
+
+
+@register.filter
+def as_string(value):
+    if value is None:
+        return ''
+    return '%s' % value
+
+
+@register.filter
+def as_list_of_strings(value):
+    return [
+        '' if (item is None) else ('%s' % item)
+        for item in value
+    ]
+
+
+@register.filter
+def add_class(value, css_class):
+    """
+    https://stackoverflow.com/questions/4124220/django-adding-css-classes-when-rendering-form-fields-in-a-template
+
+    Inserts classes into template variables that contain HTML tags,
+    useful for modifying forms without needing to change the Form objects.
+
+    Usage:
+
+        {{ field.label_tag|add_class:"control-label" }}
+
+    In the case of REST Framework, the filter is used to add Bootstrap-specific
+    classes to the forms.
+    """
+    html = str(value)
+    match = class_re.search(html)
+    if match:
+        m = re.search(r'^%s$|^%s\s|\s%s\s|\s%s$' % (css_class, css_class,
+                                                    css_class, css_class),
+                      match.group(1))
+        if not m:
+            return mark_safe(class_re.sub(match.group(1) + " " + css_class,
+                                          html))
+    else:
+        return mark_safe(html.replace('>', ' class="%s">' % css_class, 1))
+    return value
+
+
+@register.filter
+def format_value(value):
+    if getattr(value, 'is_hyperlink', False):
+        name = str(value.obj)
+        return mark_safe('<a href=%s>%s</a>' % (value, escape(name)))
+    if value is None or isinstance(value, bool):
+        return mark_safe('<code>%s</code>' % {True: 'true', False: 'false', None: 'null'}[value])
+    elif isinstance(value, list):
+        if any(isinstance(item, (list, dict)) for item in value):
+            template = loader.get_template('rest_framework/admin/list_value.html')
+        else:
+            template = loader.get_template('rest_framework/admin/simple_list_value.html')
+        context = {'value': value}
+        return template.render(context)
+    elif isinstance(value, dict):
+        template = loader.get_template('rest_framework/admin/dict_value.html')
+        context = {'value': value}
+        return template.render(context)
+    elif isinstance(value, str):
+        if (
+            (value.startswith('http:') or value.startswith('https:') or value.startswith('/')) and not
+            re.search(r'\s', value)
+        ):
+            return mark_safe('<a href="{value}">{value}</a>'.format(value=escape(value)))
+        elif '@' in value and not re.search(r'\s', value):
+            return mark_safe('<a href="mailto:{value}">{value}</a>'.format(value=escape(value)))
+        elif '\n' in value:
+            return mark_safe('<pre>%s</pre>' % escape(value))
+    return str(value)
+
+
+@register.filter
+def items(value):
+    """
+    Simple filter to return the items of the dict. Useful when the dict may
+    have a key 'items' which is resolved first in Django template dot-notation
+    lookup.  See issue #4931
+    Also see: https://stackoverflow.com/questions/15416662/django-template-loop-over-dictionary-items-with-items-as-key
+    """
+    if value is None:
+        # `{% for k, v in value.items %}` doesn't raise when value is None or
+        # not in the context, so neither should `{% for k, v in value|items %}`
+        return []
+    return value.items()
+
+
+@register.filter
+def data(value):
+    """
+    Simple filter to access `data` attribute of object,
+    specifically coreapi.Document.
+
+    As per `items` filter above, allows accessing `document.data` when
+    Document contains Link keyed-at "data".
+
+    See issue #5395
+    """
+    return value.data
+
+
+@register.filter
+def schema_links(section, sec_key=None):
+    """
+    Recursively find every link in a schema, even nested.
+    """
+    NESTED_FORMAT = '%s > %s'  # this format is used in docs/js/api.js:normalizeKeys
+    links = section.links
+    if section.data:
+        data = section.data.items()
+        for sub_section_key, sub_section in data:
+            new_links = schema_links(sub_section, sec_key=sub_section_key)
+            links.update(new_links)
+
+    if sec_key is not None:
+        new_links = {}
+        for link_key, link in links.items():
+            new_key = NESTED_FORMAT % (sec_key, link_key)
+            new_links.update({new_key: link})
+        return new_links
+
+    return links
+
+
+@register.filter
+def add_nested_class(value):
+    if isinstance(value, dict):
+        return 'class=nested'
+    if isinstance(value, list) and any(isinstance(item, (list, dict)) for item in value):
+        return 'class=nested'
+    return ''
+
+
+# Bunch of stuff cloned from urlize
+TRAILING_PUNCTUATION = ['.', ',', ':', ';', '.)', '"', "']", "'}", "'"]
+WRAPPING_PUNCTUATION = [('(', ')'), ('<', '>'), ('[', ']'), ('&lt;', '&gt;'),
+                        ('"', '"'), ("'", "'")]
+word_split_re = re.compile(r'(\s+)')
+simple_url_re = re.compile(r'^https?://\[?\w', re.IGNORECASE)
+simple_url_2_re = re.compile(r'^www\.|^(?!http)\w[^@]+\.(com|edu|gov|int|mil|net|org)$', re.IGNORECASE)
+simple_email_re = re.compile(r'^\S+@\S+\.\S+$')
+
+
+def smart_urlquote_wrapper(matched_url):
+    """
+    Simple wrapper for smart_urlquote. ValueError("Invalid IPv6 URL") can
+    be raised here, see issue #1386
+    """
+    try:
+        return smart_urlquote(matched_url)
+    except ValueError:
+        return None
+
+
+@register.filter
+def break_long_headers(header):
+    """
+    Breaks headers longer than 160 characters (~page length)
+    when possible (are comma separated)
+    """
+    if len(header) > 160 and ',' in header:
+        header = mark_safe('<br> ' + ', <br>'.join(escape(header).split(',')))
+    return header
