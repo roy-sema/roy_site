@@ -61,3 +61,18 @@ def cv():
         "Content-Disposition": "attachment; filename=roy_hanley_cv.pdf",
     })
     return response
+
+
+## Testing
+def test(pull_request, with_process_pull_request=True):
+    from mvp.services import ForceAiEngineRerunService
+    from api.tasks import ProcessPullRequestTask
+
+    (
+        data,
+        integration,
+    ) = ForceAiEngineRerunService().prepare_pull_request_for_re_analysis(
+        pull_request,
+    )
+    if with_process_pull_request:
+        ProcessPullRequestTask().run(data, integration)
