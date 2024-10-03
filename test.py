@@ -1,191 +1,232 @@
-
 """
-This module collects helper functions and classes that "span" multiple levels
-of MVC. In other words, these functions/classes introduce controlled coupling
-for convenience's sake.
+Provides various authentication policies.
 """
+import base64
+import binascii
 
-from django.http import (
-    Http404,
-    HttpResponse,
-    HttpResponsePermanentRedirect,
-    HttpResponseRedirect,
-)
-from django.template import loader
-from django.urls import NoReverseMatch, reverse
-from django.utils.functional import Promise
+from django.contrib.auth import authenticate, get_user_model
+from django.middleware.csrf import CsrfViewMiddleware
+from django.utils.translation import gettext_lazy as _
+
+from rest_framework import HTTP_HEADER_ENCODING, exceptions
 
 
-def render(
-    request, template_name, context=None, content_type=None, status=None, using=None
-):
+def get_authorization_header(request):
     """
-    Return an HttpResponse whose content is filled with the result of calling
-    django.template.loader.render_to_string() with the passed arguments.
+    Return request's 'Authorization:' header, as a bytestring.
+
+    Hide some test client ickyness where the header can be unicode.
     """
-    content = loader.render_to_string(template_name, context, request, using=using)
-    return HttpResponse(content, content_type, status)
+    auth = request.META.get('HTTP_AUTHORIZATION', b'')
+    if isinstance(auth, str):
+        # Work around django test client oddness
+        auth = auth.encode(HTTP_HEADER_ENCODING)
+    return auth
 
 
-def redirect(to, *args, permanent=False, **kwargs):
+class CSRFCheck(CsrfViewMiddleware):
+    def _reject(self, request, reason):
+        # Return the failure reason instead of an HttpResponse
+        return reason
+
+
+class BaseAuthentication:
     """
-    Return an HttpResponseRedirect to the appropriate URL for the arguments
-    passed.
-
-    The arguments could be:
-
-        * A model: the model's `get_absolute_url()` function will be called.
-
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
-
-        * A URL, which will be used as-is for the redirect location.
-
-    Issues a temporary redirect by default; pass permanent=True to issue a
-    permanent redirect.
+    All authentication classes should extend BaseAuthentication.
     """
-    redirect_class = (
-        HttpResponsePermanentRedirect if permanent else HttpResponseRedirect
-    )
-    return redirect_class(resolve_url(to, *args, **kwargs))
+
+    def authenticate(self, request):
+        """
+        Authenticate the request and return a two-tuple of (user, token).
+        """
+        raise NotImplementedError(".authenticate() must be overridden.")
+
+    def authenticate_header(self, request):
+        """
+        Return a string to be used as the value of the `WWW-Authenticate`
+        header in a `401 Unauthenticated` response, or `None` if the
+        authentication scheme should return `403 Permission Denied` responses.
+        """
+        pass
 
 
-def _get_queryset(klass):
+class BasicAuthentication(BaseAuthentication):
     """
-    Return a QuerySet or a Manager.
-    Duck typing in action: any class with a `get()` method (for
-    get_object_or_404) or a `filter()` method (for get_list_or_404) might do
-    the job.
+    HTTP Basic authentication against username/password.
     """
-    # If it is a model class or anything else with ._default_manager
-    if hasattr(klass, "_default_manager"):
-        return klass._default_manager.all()
-    return klass
+    www_authenticate_realm = 'api'
+
+    def authenticate(self, request):
+        """
+        Returns a `User` if a correct username and password have been supplied
+        using HTTP Basic authentication.  Otherwise returns `None`.
+        """
+        auth = get_authorization_header(request).split()
+
+        if not auth or auth[0].lower() != b'basic':
+            return None
+
+        if len(auth) == 1:
+            msg = _('Invalid basic header. No credentials provided.')
+            raise exceptions.AuthenticationFailed(msg)
+        elif len(auth) > 2:
+            msg = _('Invalid basic header. Credentials string should not contain spaces.')
+            raise exceptions.AuthenticationFailed(msg)
+
+        try:
+            try:
+                auth_decoded = base64.b64decode(auth[1]).decode('utf-8')
+            except UnicodeDecodeError:
+                auth_decoded = base64.b64decode(auth[1]).decode('latin-1')
+
+            userid, password = auth_decoded.split(':', 1)
+        except (TypeError, ValueError, UnicodeDecodeError, binascii.Error):
+            msg = _('Invalid basic header. Credentials not correctly base64 encoded.')
+            raise exceptions.AuthenticationFailed(msg)
+
+        return self.authenticate_credentials(userid, password, request)
+
+    def authenticate_credentials(self, userid, password, request=None):
+        """
+        Authenticate the userid and password against username and password
+        with optional request for context.
+        """
+        credentials = {
+            get_user_model().USERNAME_FIELD: userid,
+            'password': password
+        }
+        user = authenticate(request=request, **credentials)
+
+        if user is None:
+            raise exceptions.AuthenticationFailed(_('Invalid username/password.'))
+
+        if not user.is_active:
+            raise exceptions.AuthenticationFailed(_('User inactive or deleted.'))
+
+        return (user, None)
+
+    def authenticate_header(self, request):
+        return 'Basic realm="%s"' % self.www_authenticate_realm
 
 
-def get_object_or_404(klass, *args, **kwargs):
+class SessionAuthentication(BaseAuthentication):
     """
-    Use get() to return an object, or raise an Http404 exception if the object
-    does not exist.
-
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the get() query.
-
-    Like with QuerySet.get(), MultipleObjectsReturned is raised if more than
-    one object is found.
+    Use Django's session framework for authentication.
     """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "get"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_object_or_404() must be a Model, Manager, "
-            "or QuerySet, not '%s'." % klass__name
-        )
-    try:
-        return queryset.get(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
+
+    def authenticate(self, request):
+        """
+        Returns a `User` if the request session currently has a logged in user.
+        Otherwise returns `None`.
+        """
+
+        # Get the session-based user from the underlying HttpRequest object
+        user = getattr(request._request, 'user', None)
+
+        # Unauthenticated, CSRF validation not required
+        if not user or not user.is_active:
+            return None
+
+        self.enforce_csrf(request)
+
+        # CSRF passed with authenticated user
+        return (user, None)
+
+    def enforce_csrf(self, request):
+        """
+        Enforce CSRF validation for session based authentication.
+        """
+        def dummy_get_response(request):  # pragma: no cover
+            return None
+
+        check = CSRFCheck(dummy_get_response)
+        # populates request.META['CSRF_COOKIE'], which is used in process_view()
+        check.process_request(request)
+        reason = check.process_view(request, None, (), {})
+        if reason:
+            # CSRF failed, bail with explicit error message
+            raise exceptions.PermissionDenied('CSRF Failed: %s' % reason)
 
 
-async def aget_object_or_404(klass, *args, **kwargs):
-    """See get_object_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "aget"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_object_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    try:
-        return await queryset.aget(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-
-
-def get_list_or_404(klass, *args, **kwargs):
+class TokenAuthentication(BaseAuthentication):
     """
-    Use filter() to return a list of objects, or raise an Http404 exception if
-    the list is empty.
+    Simple token based authentication.
 
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the filter() query.
+    Clients should authenticate by passing the token key in the "Authorization"
+    HTTP header, prepended with the string "Token ".  For example:
+
+        Authorization: Token 401f7ac837da42b97f613d789819ff93537bee6a
     """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_list_or_404() must be a Model, Manager, or "
-            "QuerySet, not '%s'." % klass__name
-        )
-    obj_list = list(queryset.filter(*args, **kwargs))
-    if not obj_list:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-    return obj_list
 
+    keyword = 'Token'
+    model = None
 
-async def aget_list_or_404(klass, *args, **kwargs):
-    """See get_list_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_list_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    obj_list = [obj async for obj in queryset.filter(*args, **kwargs)]
-    if not obj_list:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-    return obj_list
+    def get_model(self):
+        if self.model is not None:
+            return self.model
+        from rest_framework.authtoken.models import Token
+        return Token
 
-
-def resolve_url(to, *args, **kwargs):
     """
-    Return a URL appropriate for the arguments passed.
+    A custom token model may be used, but must have the following properties.
 
-    The arguments could be:
-
-        * A model: the model's `get_absolute_url()` function will be called.
-
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
-
-        * A URL, which will be returned as-is.
+    * key -- The string identifying the token
+    * user -- The user to which the token belongs
     """
-    # If it's a model, use get_absolute_url()
-    if hasattr(to, "get_absolute_url"):
-        return to.get_absolute_url()
 
-    if isinstance(to, Promise):
-        # Expand the lazy instance, as it can cause issues when it is passed
-        # further to some Python functions like urlparse.
-        to = str(to)
+    def authenticate(self, request):
+        auth = get_authorization_header(request).split()
 
-    # Handle relative URLs
-    if isinstance(to, str) and to.startswith(("./", "../")):
-        return to
+        if not auth or auth[0].lower() != self.keyword.lower().encode():
+            return None
 
-    # Next try a reverse URL resolution.
-    try:
-        return reverse(to, args=args, kwargs=kwargs)
-    except NoReverseMatch:
-        # If this is a callable, re-raise.
-        if callable(to):
-            raise
-        # If this doesn't "feel" like a URL, re-raise.
-        if "/" not in to and "." not in to:
-            raise
+        if len(auth) == 1:
+            msg = _('Invalid token header. No credentials provided.')
+            raise exceptions.AuthenticationFailed(msg)
+        elif len(auth) > 2:
+            msg = _('Invalid token header. Token string should not contain spaces.')
+            raise exceptions.AuthenticationFailed(msg)
 
-    # Finally, fall back and assume it's a URL
-    return to
+        try:
+            token = auth[1].decode()
+        except UnicodeError:
+            msg = _('Invalid token header. Token string should not contain invalid characters.')
+            raise exceptions.AuthenticationFailed(msg)
+
+        return self.authenticate_credentials(token)
+
+    def authenticate_credentials(self, key):
+        model = self.get_model()
+        try:
+            token = model.objects.select_related('user').get(key=key)
+        except model.DoesNotExist:
+            raise exceptions.AuthenticationFailed(_('Invalid token.'))
+
+        if not token.user.is_active:
+            raise exceptions.AuthenticationFailed(_('User inactive or deleted.'))
+
+        return (token.user, token)
+
+    def authenticate_header(self, request):
+        return self.keyword
+
+
+class RemoteUserAuthentication(BaseAuthentication):
+    """
+    REMOTE_USER authentication.
+
+    To use this, set up your web server to perform authentication, which will
+    set the REMOTE_USER environment variable. You will need to have
+    'django.contrib.auth.backends.RemoteUserBackend in your
+    AUTHENTICATION_BACKENDS setting
+    """
+
+    # Name of request header to grab username from.  This will be the key as
+    # used in the request.META dictionary, i.e. the normalization of headers to
+    # all uppercase and the addition of "HTTP_" prefix apply.
+    header = "REMOTE_USER"
+
+    def authenticate(self, request):
+        user = authenticate(request=request, remote_user=request.META.get(self.header))
+        if user and user.is_active:
+            return (user, None)
