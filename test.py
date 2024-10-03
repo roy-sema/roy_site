@@ -1,191 +1,248 @@
+<script setup lang="ts">
+import * as Sentry from "@sentry/vue";
+import type { RepositoryFile, RepositoryFileChunk, RepositoryPullRequest } from "@/helpers/api.d";
+import type { Ref } from "vue";
+import {computed, onMounted, ref} from "vue";
+import { useRepositoryFilesStore } from "@/stores/repositoryFiles";
+import {
+  getRepositoryFiles,
+  getRepositoryFilesNextPage,
+  getPullRequestComposition,
+  getRepositoryFileDetails,
+  reRunAnalysisForPR,
+} from "@/helpers/api";
+import DialogBox from "@/components/common/DialogBox.vue";
+import AISummary from "@/components/common/AISummary.vue";
+import AlertMessage from "@/components/common/AlertMessage.vue";
+import TWESpinner from "@/components/common/TWESpinner.vue";
+import FileViewer from "@/components/FileViewer/FileViewer.vue";
 
-"""
-This module collects helper functions and classes that "span" multiple levels
-of MVC. In other words, these functions/classes introduce controlled coupling
-for convenience's sake.
-"""
+// other ways of defining props does not work with the django plugin, default is provided for typescript checker
+const props = defineProps({
+  aiComposition: { type: String, default: "" },
+  codeGenerationLabels: { type: String, default: "" },
+  notEvaluatedFiles: { type: String, default: "" },
+  pullRequest: { type: String, default: "" },
+  repository: { type: String, default: "" }
+});
 
-from django.http import (
-    Http404,
-    HttpResponse,
-    HttpResponsePermanentRedirect,
-    HttpResponseRedirect,
-)
-from django.template import loader
-from django.urls import NoReverseMatch, reverse
-from django.utils.functional import Promise
+let loading: Ref<boolean> = ref(true);
+let loadingComposition: Ref<boolean> = ref(false);
+let loadingMoreFiles: Ref<boolean> = ref(false);
+let files: Ref<RepositoryFile[]> = ref([]);
+let chunkLoading: Ref<boolean> = ref(false);
+let ReRunAnalysisDialogBoxVisible: Ref<boolean> = ref(false)
+let ReRunAnalysisActivated: Ref<boolean> = ref(false)
+const errorText = ref("");
+const repositoryFilesStore = useRepositoryFilesStore();
 
+const aiComposition: Ref<any> = ref(JSON.parse(props.aiComposition)); // TODO: add type for aiComposition
+const notEvaluatedFiles: Ref<string[]> = ref(JSON.parse(props.notEvaluatedFiles));
+const pullRequest: Ref<RepositoryPullRequest> = ref(JSON.parse(props.pullRequest));
 
-def render(
-    request, template_name, context=None, content_type=None, status=None, using=None
-):
-    """
-    Return an HttpResponse whose content is filled with the result of calling
-    django.template.loader.render_to_string() with the passed arguments.
-    """
-    content = loader.render_to_string(template_name, context, request, using=using)
-    return HttpResponse(content, content_type, status)
+const loadFiles = async () => {
+  const repositoryId = pullRequest.value.repository.public_id;
+  const commitSha = pullRequest.value.head_commit_sha;
+  try {
+    errorText.value = "";
+    const response = await getRepositoryFiles(repositoryId, commitSha);
+    const repositoryFiles = response.results;
+    repositoryFilesStore.addRepositoryFiles(repositoryId, commitSha, repositoryFiles);
+    files.value = repositoryFiles;
+    if (response.next) {
+      loadFilesNextPages(response.next);
+    }
+  } catch (error) {
+    Sentry.captureException(error);
+    errorText.value = "An Error has occurred. Please refresh the page or try again later.";
+  } finally {
+    loading.value = false;
+  }
+};
 
+const loadFilesNextPages = async (nextUrl: string) => {
+  const repositoryId = pullRequest.value.repository.public_id;
+  const commitSha = pullRequest.value.head_commit_sha;
+  loadingMoreFiles.value = true;
 
-def redirect(to, *args, permanent=False, **kwargs):
-    """
-    Return an HttpResponseRedirect to the appropriate URL for the arguments
-    passed.
+  while (nextUrl) {
+    let response = await getRepositoryFilesNextPage(nextUrl);
+    let repositoryFiles = response.results;
+    repositoryFilesStore.addRepositoryFiles(repositoryId, commitSha, repositoryFiles);
+    files.value = [...files.value, ...repositoryFiles];
+    nextUrl = response.next;
+  }
 
-    The arguments could be:
+  loadingMoreFiles.value = false;
+};
 
-        * A model: the model's `get_absolute_url()` function will be called.
+const fetchFile = async (file: RepositoryFile, forced = false) => {
+  if (!file?.not_evaluated && (forced || !file.chunks_code_loaded)) {
+    if (!forced) chunkLoading.value = true;
+    const repositoryId = pullRequest.value.repository.public_id;
+    const commitSha = pullRequest.value.head_commit_sha;
+    try {
+      errorText.value = "";
+      const fileDetail = await getRepositoryFileDetails(repositoryId, commitSha, file.public_id);
+      fileDetail.chunks_code_loaded = true;
+      repositoryFilesStore.updateRepositoryFile(repositoryId, commitSha, fileDetail);
+    } catch (error) {
+      Sentry.captureException(error);
+      errorText.value = "An Error has occurred. Please refresh the page or try again later.";
+    } finally {
+      chunkLoading.value = false;
+    }
+  }
+};
 
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
+const refreshComposition = (polling: boolean = false) => {
+  // avoid multiple requests
+  if (loadingComposition.value && !polling) {
+    return;
+  }
 
-        * A URL, which will be used as-is for the redirect location.
+  const repository = pullRequest.value.repository;
 
-    Issues a temporary redirect by default; pass permanent=True to issue a
-    permanent redirect.
-    """
-    redirect_class = (
-        HttpResponsePermanentRedirect if permanent else HttpResponseRedirect
-    )
-    return redirect_class(resolve_url(to, *args, **kwargs))
+  loadingComposition.value = true;
+  getPullRequestComposition(repository.public_id, pullRequest.value.pr_number).then((result) => {
+    aiComposition.value = result.ai_composition;
 
+    // PR composition is updated in the background, so we'll keep requesting until it's updated
+    // TODO: this is an error-prone approach.
+    //       Because many users can be attesting at the same time, we should either
+    //       implement a websocket or poll continuously.
+    if (result.needs_composition_recalculation) {
+      setTimeout(() => refreshComposition(true), 5000);
+    } else {
+      loadingComposition.value = false;
+    }
+  });
+};
 
-def _get_queryset(klass):
-    """
-    Return a QuerySet or a Manager.
-    Duck typing in action: any class with a `get()` method (for
-    get_object_or_404) or a `filter()` method (for get_list_or_404) might do
-    the job.
-    """
-    # If it is a model class or anything else with ._default_manager
-    if hasattr(klass, "_default_manager"):
-        return klass._default_manager.all()
-    return klass
+const reRunAnalysis = async () => {
+  const repository = pullRequest.value.repository;
+  try {
+    errorText.value = "";
+    await reRunAnalysisForPR(repository.public_id, pullRequest.value.pr_number);
+  } catch (error) {
+    Sentry.captureException(error);
+    errorText.value = "An Error has occurred. Please refresh the page or try again later.";
+  } finally {
+    ReRunAnalysisActivated.value = true;
+    // Hacky reload to get page to display
+    // `Pull Request is being analyzed` message.
+    setTimeout(() => {
+      window.location.reload();
+    }, 2000);
+  }
+};
 
+const updateData = ({
+  file,
+  chunk,
+}: {
+  file: RepositoryFile;
+  chunk: RepositoryFileChunk;
+}) => {
+  repositoryFilesStore.clearChunkAffectedFiles(chunk.code_hash, file);
+  fetchFile(file, true);
+  refreshComposition();
+};
 
-def get_object_or_404(klass, *args, **kwargs):
-    """
-    Use get() to return an object, or raise an Http404 exception if the object
-    does not exist.
+const updateAttestedAll = ({
+  file,
+  chunks,
+}: {
+  file: RepositoryFile;
+  chunks: RepositoryFileChunk[];
+}) => {
+  chunks.forEach((chunk) => {
+    repositoryFilesStore.clearChunkAffectedFiles(chunk.code_hash, file);
+  });
+  fetchFile(file, true);
+  refreshComposition();
+};
 
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the get() query.
+const ShowReRunAnalysisDialogBox = () => {
+  ReRunAnalysisDialogBoxVisible.value = true;
+};
 
-    Like with QuerySet.get(), MultipleObjectsReturned is raised if more than
-    one object is found.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "get"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_object_or_404() must be a Model, Manager, "
-            "or QuerySet, not '%s'." % klass__name
-        )
-    try:
-        return queryset.get(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
+const reRunAnalysisButtonDisabled = computed(() =>
+    loading || ReRunAnalysisActivated
+);
 
+onMounted(() => {
+  loadFiles();
 
-async def aget_object_or_404(klass, *args, **kwargs):
-    """See get_object_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "aget"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_object_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    try:
-        return await queryset.aget(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
+  if (pullRequest.value.needs_composition_recalculation) {
+    refreshComposition();
+  }
+});
+</script>
 
+<template>
+  <main>
+    <div class="relative">
+      <AISummary
+        :aiComposition="aiComposition"
+        :isPullRequest="true"
+        :loading="loadingComposition"
+        :numAnalyzedFiles="pullRequest.analysis_num_files"
+        :numNotEvaluatedFiles="pullRequest.not_evaluated_num_files"
+      />
+    </div>
+    <DialogBox
+      :action="reRunAnalysis"
+      :visible="ReRunAnalysisDialogBoxVisible"
+      :title="'Re-run analysis?'"
+      :message="'This operation will take some time.<br /> Are you sure?'"
+      @disable="() => { ReRunAnalysisDialogBoxVisible = false }"
+    />
+    <div v-if="!ReRunAnalysisActivated" class="flex w-full">
+      <button
+        @click="ShowReRunAnalysisDialogBox"
+        :disabled="reRunAnalysisButtonDisabled.value"
+        class="ml-auto rounded-md bg-blue px-3 py-1.5 text-sm font-semibold leading-6 text-white shadow-sm whitespace-nowrap hover:bg-violet dark:hover:bg-pink"
+      >
+        Re-run Analysis
+      </button>
+    </div>
 
-def get_list_or_404(klass, *args, **kwargs):
-    """
-    Use filter() to return a list of objects, or raise an Http404 exception if
-    the list is empty.
+    <AlertMessage dismissable warning class="mt-10">
+      GenAI composition is automatically detected, and it's NOT 100% accurate. Please use the attestation buttons below
+      to fix any errors. Thank you!
+    </AlertMessage>
 
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the filter() query.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_list_or_404() must be a Model, Manager, or "
-            "QuerySet, not '%s'." % klass__name
-        )
-    obj_list = list(queryset.filter(*args, **kwargs))
-    if not obj_list:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-    return obj_list
+    <div class="text-center mt-10" v-show="loading">
+      <TWESpinner />
+    </div>
+    <div v-show="!loading">
+      <div v-show="files.length" class="mt-10">
+        <FileViewer
+          :codeGenerationLabels
+          :repositoryFullName="pullRequest.repository.full_name"
+          :repositoryId="pullRequest.repository.public_id"
+          :files
+          :chunkLoading
+          :errorText
+          :expandAll="true"
+          :loading-more-files="loadingMoreFiles"
+          @attested="updateData"
+          @attested-all="updateAttestedAll($event)"
+          @selectFile="fetchFile($event)"
+        />
+      </div>
 
+      <div v-if="notEvaluatedFiles.length">
+        <h3 class="text-lg md:text-xl mb-4 font-semibold mt-10">
+          Not evaluated files ({{ notEvaluatedFiles.length }})
+        </h3>
+        <ul class="mt-5 ml-5 list-disc">
+          <li v-for="filePath in notEvaluatedFiles" :key="filePath" class="text-sm">{{ filePath }}</li>
+        </ul>
+      </div>
 
-async def aget_list_or_404(klass, *args, **kwargs):
-    """See get_list_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_list_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    obj_list = [obj async for obj in queryset.filter(*args, **kwargs)]
-    if not obj_list:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-    return obj_list
-
-
-def resolve_url(to, *args, **kwargs):
-    """
-    Return a URL appropriate for the arguments passed.
-
-    The arguments could be:
-
-        * A model: the model's `get_absolute_url()` function will be called.
-
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
-
-        * A URL, which will be returned as-is.
-    """
-    # If it's a model, use get_absolute_url()
-    if hasattr(to, "get_absolute_url"):
-        return to.get_absolute_url()
-
-    if isinstance(to, Promise):
-        # Expand the lazy instance, as it can cause issues when it is passed
-        # further to some Python functions like urlparse.
-        to = str(to)
-
-    # Handle relative URLs
-    if isinstance(to, str) and to.startswith(("./", "../")):
-        return to
-
-    # Next try a reverse URL resolution.
-    try:
-        return reverse(to, args=args, kwargs=kwargs)
-    except NoReverseMatch:
-        # If this is a callable, re-raise.
-        if callable(to):
-            raise
-        # If this doesn't "feel" like a URL, re-raise.
-        if "/" not in to and "." not in to:
-            raise
-
-    # Finally, fall back and assume it's a URL
-    return to
+      <div class="mt-10" v-else-if="!files.length">We found no supported files in this Pull Request.</div>
+    </div>
+  </main>
+</template>
