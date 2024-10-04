@@ -27,3 +27,16 @@ from mvp.integrations import (
 )
 from mvp.tasks import DownloadRepositoriesTask
 from mvp.utils import run_command_subprocess
+
+
+def test(pr):
+    from api.tasks import ProcessPullRequestTask
+    from mvp.services import ForceAiEngineRerunService
+    (
+        data,
+        integration,
+    ) = ForceAiEngineRerunService().prepare_pull_request_for_re_analysis(
+        pr,
+    )
+    if data and integration:
+        ProcessPullRequestTask().run(data, integration)
