@@ -1,203 +1,83 @@
+import random
+import datetime
 
-"""
-This module collects helper functions and classes that "span" multiple levels
-of MVC. In other words, these functions/classes introduce controlled coupling
-for convenience's sake.
-"""
+def generate_random_numbers(count, start=1, end=100):
+    """Generate a list of random numbers."""
+    return [random.randint(start, end) for _ in range(count)]
 
-from django.http import (
-    Http404,
-    HttpResponse,
-    HttpResponsePermanentRedirect,
-    HttpResponseRedirect,
-)
-from django.template import loader
-from django.urls import NoReverseMatch, reverse
-from django.utils.functional import Promise
+class Person:
+    """A simple Person class."""
+    def __init__(self, name, age):
+        self.name = name
+        self.age = age
 
+    def greet(self):
+        return f"Hello, my name is {self.name} and I am {self.age} years old."
 
-def render(
-    request, template_name, context=None, content_type=None, status=None, using=None
-):
-    """
-    Return an HttpResponse whose content is filled with the result of calling
-    django.template.loader.render_to_string() with the passed arguments.
-    """
-    content = loader.render_to_string(template_name, context, request, using=using)
-    return HttpResponse(content, content_type, status)
+def write_to_file(filename, data):
+    """Write data to a file."""
+    with open(filename, "w") as file:
+        file.write(data)
 
+def read_from_file(filename):
+    """Read data from a file."""
+    with open(filename, "r") as file:
+        return file.read()
 
-def redirect(to, *args, permanent=False, **kwargs):
-    """
-    Return an HttpResponseRedirect to the appropriate URL for the arguments
-    passed.
+def factorial(n):
+    """Calculate factorial recursively."""
+    return 1 if n == 0 else n * factorial(n - 1)
 
-    The arguments could be:
+def fibonacci(n):
+    """Generate Fibonacci sequence up to n elements."""
+    sequence = [0, 1]
+    for _ in range(n - 2):
+        sequence.append(sequence[-1] + sequence[-2])
+    return sequence
 
-        * A model: the model's `get_absolute_url()` function will be called.
+def current_datetime():
+    """Return the current date and time."""
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
+def check_prime(n):
+    """Check if a number is prime."""
+    if n < 2:
+        return False
+    for i in range(2, int(n ** 0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
 
-        * A URL, which will be used as-is for the redirect location.
+def count_vowels(text):
+    """Count vowels in a given string."""
+    return sum(1 for char in text.lower() if char in "aeiou")
 
-    Issues a temporary redirect by default; pass permanent=True to issue a
-    permanent redirect.
-    """
-    redirect_class = (
-        HttpResponsePermanentRedirect if permanent else HttpResponseRedirect
-    )
-    return redirect_class(resolve_url(to, *args, **kwargs))
+def main():
+    print("Generating 10 random numbers:", generate_random_numbers(10))
+    
+    john = Person("John", 30)
+    print(john.greet())
+    
+    print("Factorial of 5:", factorial(5))
+    print("Fibonacci sequence (10 terms):", fibonacci(10))
+    
+    print("Checking primes between 1 and 20:")
+    for num in range(1, 21):
+        if check_prime(num):
+            print(num, end=" ")
+    print()
+    
+    sample_text = "Hello, how many vowels are in this sentence?"
+    print(f"Vowel count: {count_vowels(sample_text)}")
+    
+    filename = "example.txt"
+    write_to_file(filename, "This is an example file.")
+    print("File contents:", read_from_file(filename))
+    
+    print("Current Date & Time:", current_datetime())
+    
+    print("Done!")
 
-
-def _get_queryset(klass):
-    """
-    Return a QuerySet or a Manager.
-    Duck typing in action: any class with a `get()` method (for
-    get_object_or_404) or a `filter()` method (for get_list_or_404) might do
-    the job.
-    """
-    # If it is a model class or anything else with ._default_manager
-    if hasattr(klass, "_default_manager"):
-        return klass._default_manager.all()
-    return klass
-
-
-def get_object_or_404(klass, *args, **kwargs):
-    """
-    Use get() to return an object, or raise an Http404 exception if the object
-    does not exist.
-
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the get() query.
-
-    Like with QuerySet.get(), MultipleObjectsReturned is raised if more than
-    one object is found.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "get"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_object_or_404() must be a Model, Manager, "
-            "or QuerySet, not '%s'." % klass__name
-        )
-    try:
-        return queryset.get(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-
-
-async def aget_object_or_404(klass, *args, **kwargs):
-    """See get_object_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "aget"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_object_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    try:
-        return await queryset.aget(*args, **kwargs)
-    except queryset.model.DoesNotExist:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-
-
-def get_list_or_404(klass, *args, **kwargs):
-    """
-    Use filter() to return a list of objects, or raise an Http404 exception if
-    the list is empty.
-
-    klass may be a Model, Manager, or QuerySet object. All other passed
-    arguments and keyword arguments are used in the filter() query.
-    """
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to get_list_or_404() must be a Model, Manager, or "
-            "QuerySet, not '%s'." % klass__name
-        )
-    obj_list = list(queryset.filter(*args, **kwargs))
-    if not obj_list:
-        raise Http404(
-            "No %s matches the given query." % queryset.model._meta.object_name
-        )
-    return obj_list
-
-
-async def aget_list_or_404(klass, *args, **kwargs):
-    """See get_list_or_404()."""
-    queryset = _get_queryset(klass)
-    if not hasattr(queryset, "filter"):
-        klass__name = (
-            klass.__name__ if isinstance(klass, type) else klass.__class__.__name__
-        )
-        raise ValueError(
-            "First argument to aget_list_or_404() must be a Model, Manager, or "
-            f"QuerySet, not '{klass__name}'."
-        )
-    obj_list = [obj async for obj in queryset.filter(*args, **kwargs)]
-    if not obj_list:
-        raise Http404(f"No {queryset.model._meta.object_name} matches the given query.")
-    return obj_list
-
-
-def resolve_url(to, *args, **kwargs):
-    """
-    Return a URL appropriate for the arguments passed.
-
-    The arguments could be:
-
-        * A model: the model's `get_absolute_url()` function will be called.
-
-        * A view name, possibly with arguments: `urls.reverse()` will be used
-          to reverse-resolve the name.
-
-        * A URL, which will be returned as-is.
-    """
-    # If it's a model, use get_absolute_url()
-    if hasattr(to, "get_absolute_url"):
-        return to.get_absolute_url()
-
-    if isinstance(to, Promise):
-        # Expand the lazy instance, as it can cause issues when it is passed
-        # further to some Python functions like urlparse.
-        to = str(to)
-
-    # Handle relative URLs
-    if isinstance(to, str) and to.startswith(("./", "../")):
-        return to
-
-    # Next try a reverse URL resolution.
-    try:
-        return reverse(to, args=args, kwargs=kwargs)
-    except NoReverseMatch:
-        # If this is a callable, re-raise.
-        if callable(to):
-            raise
-        # If this doesn't "feel" like a URL, re-raise.
-        if "/" not in to and "." not in to:
-            raise
-
-    # Finally, fall back and assume it's a URL
-    return to
-
-
-def test():
-    print("test 1")
-
-    if not pipeline or pipeline == cls.PIPELINE_A:
-        service.execute_pipeline_a(
-            data_dir,
-            start_date,
-            end_date,
-            dry_run=dry_run,
-        )    
+if __name__ == "__main__":
+    main()
+    
