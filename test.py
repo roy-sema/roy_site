@@ -193,3 +193,11 @@ def resolve_url(to, *args, **kwargs):
 
 def test():
     print("test 1")
+
+    if not pipeline or pipeline == cls.PIPELINE_A:
+        service.execute_pipeline_a(
+            data_dir,
+            start_date,
+            end_date,
+            dry_run=dry_run,
+        )    
