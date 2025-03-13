@@ -1,89 +1,58 @@
-import random
-import time
+import mysql.connector
 
-def generate_random_numbers(count, start=1, end=100):
-    return [random.randint(start, end) for _ in range(count)]
+mydb = mysql.connector.connect(
+  host="localhost",
+  user="yourusername",
+  password="yourpassword",
+  database="mydatabase"
+)
 
-def bubble_sort(arr):
-    n = len(arr)
-    for i in range(n):
-        for j in range(0, n-i-1):
-            if arr[j] > arr[j+1]:
-                arr[j], arr[j+1] = arr[j+1], arr[j]
+mycursor = mydb.cursor()
 
-def main():
-    numbers = generate_random_numbers(50)
-    print("Unsorted Numbers:", numbers)
-    start_time = time.time()
-    bubble_sort(numbers)
-    end_time = time.time()
-    print("Sorted Numbers:", numbers)
-    print(f"Sorting took {end_time - start_time:.5f} seconds")
+sql = "INSERT INTO customers (name, address) VALUES (%s, %s)"
+val = ("John", "Highway 21")
+mycursor.execute(sql, val)
 
-if __name__ == "__main__":
-    main()
+mydb.commit()
 
-def fibonacci(n):
-    if n <= 0:
-        return []
-    elif n == 1:
-        return [0]
-    elif n == 2:
-        return [0, 1]
-    fib_series = [0, 1]
-    for i in range(2, n):
-        fib_series.append(fib_series[-1] + fib_series[-2])
-    return fib_series
+print(mycursor.rowcount, "record inserted.")
 
-def print_fibonacci():
-    n = 10
-    print(f"First {n} Fibonacci numbers: {fibonacci(n)}")
 
-print_fibonacci()
+import mysql.connector
 
-def is_prime(n):
-    if n < 2:
-        return False
-    for i in range(2, int(n ** 0.5) + 1):
-        if n % i == 0:
-            return False
-    return True
+mydb = mysql.connector.connect(
+  host="localhost",
+  user="yourusername",
+  password="yourpassword",
+  database="mydatabase"
+)
 
-def generate_primes(limit):
-    primes = []
-    num = 2
-    while len(primes) < limit:
-        if is_prime(num):
-            primes.append(num)
-        num += 1
-    return primes
+mycursor = mydb.cursor()
 
-def print_primes():
-    limit = 10
-    print(f"First {limit} prime numbers: {generate_primes(limit)}")
+mycursor.execute("SELECT * FROM customers")
 
-print_primes()
+myresult = mycursor.fetchall()
 
-def factorial(n):
-    if n == 0 or n == 1:
-        return 1
-    return n * factorial(n - 1)
+for x in myresult:
+  print(x)
 
-def print_factorials():
-    for i in range(10):
-        print(f"Factorial of {i} is {factorial(i)}")
 
-print_factorials()
+import mysql.connector
 
-def countdown(n):
-    while n > 0:
-        print(n)
-        time.sleep(0.5)
-        n -= 1
-    print("Time's up!")
+mydb = mysql.connector.connect(
+  host="localhost",
+  user="yourusername",
+  password="yourpassword",
+  database="mydatabase"
+)
 
-def run_countdown():
-    countdown(5)
+mycursor = mydb.cursor()
 
-run_countdown()
+sql = "SELECT * FROM customers WHERE address ='Park Lane 38'"
 
+mycursor.execute(sql)
+
+myresult = mycursor.fetchall()
+
+for x in myresult:
+  print(x)
