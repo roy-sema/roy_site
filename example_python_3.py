@@ -1,121 +1,153 @@
-from django.conf import settings
-from django.core.management import CommandError
-from django.core.management.base import BaseCommand
-from django.template.loader import render_to_string
-from django.utils import timezone
+from django.contrib.auth.decorators import login_required
+from django.http import HttpResponseRedirect
+from django.urls import reverse
+from django.utils.decorators import method_decorator
+from django.views.generic import TemplateView
 
-from mvp.models import Organization
-from mvp.services import EmailService
-from mvp.services.aggregated_message_service import AggregatedMessageService
-from mvp.services.contextualization_service import ContextualizationDayInterval
+from allauth.account import app_settings as account_settings
+from allauth.account.internal.decorators import login_stage_required
+from allauth.account.views import BaseReauthenticateView
+from allauth.mfa import app_settings
+from allauth.mfa.base.forms import AuthenticateForm, ReauthenticateForm
+from allauth.mfa.models import Authenticator
+from allauth.mfa.stages import AuthenticateStage
+from allauth.mfa.utils import is_mfa_enabled
+from allauth.mfa.webauthn.forms import AuthenticateWebAuthnForm
+from allauth.mfa.webauthn.internal.flows import auth as webauthn_auth
+from allauth.utils import get_form_class
 
 
-class Command(BaseCommand):
-    help = "Generate and send the Daily Message email"
+@method_decorator(
+    login_stage_required(stage=AuthenticateStage.key, redirect_urlname="account_login"),
+    name="dispatch",
+)
+class AuthenticateView(TemplateView):
+    form_class = AuthenticateForm
+    webauthn_form_class = AuthenticateWebAuthnForm
+    template_name = "mfa/authenticate." + account_settings.TEMPLATE_EXTENSION
 
-    def add_arguments(self, parser):
-        parser.add_argument(
-            "--output", type=str, help="Filename to save the email content."
-        )
-        parser.add_argument(
-            "--orgid",
-            type=int,
-            help="Narrow execution just to given organization ID.",
-        )
+    def dispatch(self, request, *args, **kwargs):
+        self.stage = request._login_stage
+        if not is_mfa_enabled(
+            self.stage.login.user,
+            [Authenticator.Type.TOTP, Authenticator.Type.WEBAUTHN],
+        ):
+            return HttpResponseRedirect(reverse("account_login"))
+        self.form = self._build_forms()
+        return super().dispatch(request, *args, **kwargs)
 
-    def handle(self, *args, **options):
-        try:
-            organization_id = options.get("orgid", 0)
-            if organization_id:
-                organizations = Organization.objects.filter(id=organization_id)
-                if not organizations:
-                    raise CommandError(
-                        f'Organization with ID "{organization_id}" does not exist.'
-                    )
+    def post(self, request, *args, **kwargs):
+        if self.form.is_valid():
+            return self.form_valid(self.form)
+        else:
+            return self.form_invalid(self.form)
+
+    def _build_forms(self):
+        posted_form = None
+        AuthenticateFormClass = self.get_form_class()
+        AuthenticateWebAuthnFormClass = self.get_webauthn_form_class()
+        user = self.stage.login.user
+        support_webauthn = "webauthn" in app_settings.SUPPORTED_TYPES
+        if self.request.method == "POST":
+            if "code" in self.request.POST:
+                posted_form = self.auth_form = AuthenticateFormClass(
+                    user=user, data=self.request.POST
+                )
+                self.webauthn_form = (
+                    AuthenticateWebAuthnFormClass(user=user)
+                    if support_webauthn
+                    else None
+                )
             else:
-                organizations = Organization.objects.all()
-
-            emails_sent_to_orgs = []
-            for organization in organizations:
-                data = self.get_daily_message_data(organization)
-
-                content = render_to_string(
-                    "mvp/emails/daily_message.txt", {"message": data}
+                self.auth_form = (
+                    AuthenticateFormClass(user=user) if support_webauthn else None
                 )
-
-                if options.get("output"):
-                    with open(f"{options['output']}.txt", "w") as f:
-                        f.write(content)
-
-                    self.stdout.write(
-                        self.style.SUCCESS(f"Email saved to {options['output']}")
-                    )
-
-                emails_sent_to_orgs.append(organization.name)
-
-                self.send_email(
-                    subject=f"SIP-Daily Message - {organization.name}",
-                    message=content,
+                posted_form = self.webauthn_form = AuthenticateWebAuthnFormClass(
+                    user=user, data=self.request.POST
                 )
-
-            self.stdout.write(
-                self.style.SUCCESS(
-                    "Daily message email sent to "
-                    f"organizations: {', '.join(emails_sent_to_orgs) or 'None'}"
-                )
+        else:
+            self.auth_form = AuthenticateFormClass(user=user)
+            self.webauthn_form = (
+                AuthenticateWebAuthnFormClass(user=user) if support_webauthn else None
             )
+        return posted_form
 
-        except Exception as e:
-            self.stdout.write(self.style.ERROR(f"Error: {str(e)}"))
-            raise
+    def get_form_class(self):
+        return get_form_class(app_settings.FORMS, "authenticate", self.form_class)
 
-    def get_daily_message_data(self, organization):
-        """
-        Get data for the daily message.
-        In a real implementation, this would likely fetch from databases or APIs.
-        """
-        data = AggregatedMessageService.get_for_day_interval(
-            organization, ContextualizationDayInterval.ONE_DAY
+    def get_webauthn_form_class(self):
+        return get_form_class(
+            app_settings.FORMS, "authenticate_webauthn", self.webauthn_form_class
         )
 
-        risk_map = {
-            x["significance_score"]: x
-            for x in data["anomaly_insights_and_risks"]["risk_insights"]
-        }
+    def form_valid(self, form):
+        form.save()
+        return self.stage.exit()
 
-        anomaly_map = {
-            x["significance_score"]: x
-            for x in data["anomaly_insights_and_risks"]["anomaly_insights"]
-        }
+    def form_invalid(self, form):
+        return super().get(self.request)
 
-        insights = []
-        for score in (10, 9, 8, 7):
-            anomaly = anomaly_map.get(score)
-            risk = risk_map.get(score)
-            items = []
-
-            if anomaly:
-                items.append(anomaly)
-
-            if risk:
-                items.append(risk)
-
-            if not items:
-                continue
-
-            insights.append(items)
-
-        return {
-            "last_updated": timezone.now(),
-            "organization": organization,
-            "insights": insights,
-        }
-
-    def send_email(self, subject, message):
-        """Send the daily message email"""
-        EmailService.send_email(
-            subject=subject,
-            message=message,
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[settings.DAILY_MESSAGE_RECIPIENT],
+    def get_context_data(self, **kwargs):
+        ret = super().get_context_data()
+        ret.update(
+            {
+                "form": self.auth_form,
+                "MFA_SUPPORTED_TYPES": app_settings.SUPPORTED_TYPES,
+            }
         )
+        if self.webauthn_form:
+            request_options = webauthn_auth.begin_authentication(self.stage.login.user)
+            ret.update(
+                {
+                    "webauthn_form": self.webauthn_form,
+                    "js_data": {"request_options": request_options},
+                }
+            )
+        return ret
+
+
+authenticate = AuthenticateView.as_view()
+
+
+@method_decorator(login_required, name="dispatch")
+class ReauthenticateView(BaseReauthenticateView):
+    form_class = ReauthenticateForm
+    template_name = "mfa/reauthenticate." + account_settings.TEMPLATE_EXTENSION
+
+    def get_form_kwargs(self):
+        ret = super().get_form_kwargs()
+        ret["user"] = self.request.user
+        return ret
+
+    def get_form_class(self):
+        return get_form_class(app_settings.FORMS, "reauthenticate", self.form_class)
+
+    def form_valid(self, form):
+        form.save()
+        return super().form_valid(form)
+
+
+reauthenticate = ReauthenticateView.as_view()
+
+
+@method_decorator(login_required, name="dispatch")
+class IndexView(TemplateView):
+    template_name = "mfa/index." + account_settings.TEMPLATE_EXTENSION
+
+    def get_context_data(self, **kwargs):
+        ret = super().get_context_data(**kwargs)
+        authenticators = {}
+        for auth in Authenticator.objects.filter(user=self.request.user):
+            if auth.type == Authenticator.Type.WEBAUTHN:
+                auths = authenticators.setdefault(auth.type, [])
+                auths.append(auth.wrap())
+            else:
+                authenticators[auth.type] = auth.wrap()
+        ret["authenticators"] = authenticators
+        ret["MFA_SUPPORTED_TYPES"] = app_settings.SUPPORTED_TYPES
+        ret["is_mfa_enabled"] = is_mfa_enabled(self.request.user)
+        return ret
+
+
+index = IndexView.as_view()
+
