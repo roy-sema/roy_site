@@ -1,178 +1,131 @@
+from django import forms
+from django.utils.translation import gettext_lazy as _
 
-ifrom datetime import date, datetime
-
-from django.db.models import QuerySet
-from django.utils import timezone
-
-from compass.codebasereports.widgets.sema_score_widget import SemaScoreWidget
-from mvp.models import AITypeChoices, Organization, Repository, RepositoryCommit
-from mvp.services import (
-    AICompositionService,
-    ConnectedIntegrationsService,
-    ContextualizationService,
-    ContextualizationDayInterval,
+from allauth.core import context
+from allauth.mfa import app_settings
+from allauth.mfa.adapter import get_adapter
+from allauth.mfa.base.internal.flows import (
+    check_rate_limit,
+    post_authentication,
 )
+from allauth.mfa.models import Authenticator
+from allauth.mfa.webauthn.internal import auth, flows
 
 
-class AggregatedMessageService:
+class _BaseAddWebAuthnForm(forms.Form):
+    name = forms.CharField(required=False)
+    credential = forms.JSONField(required=True, widget=forms.HiddenInput)
 
-    ATTENTION_LEVEL_CEO = "attention_level_ceo"
-    ATTENTION_LEVEL_CEO_OR_CPO = "attention_level_ceo_or_cpo"
-    ATTENTION_LEVEL_DIRECTOR_OR_MANAGER = "attention_level_director_or_manager"
-    ATTENTION_LEVEL_TEAM_LEAD = "attention_level_team_lead"
-
-    ATTENTION_LEVELS_MAP = {
-        10: ATTENTION_LEVEL_CEO,
-        9: ATTENTION_LEVEL_CEO_OR_CPO,
-        8: ATTENTION_LEVEL_DIRECTOR_OR_MANAGER,
-        7: ATTENTION_LEVEL_TEAM_LEAD,
-    }
-
-    @classmethod
-    def get_for_day_interval(
-        cls,
-        organization: Organization,
-        day_interval: ContextualizationDayInterval,
-    ):
-        """
-        This collects data from various services across the system to
-        provide data for the daily and weekly message emails and views.
-
-        NOTE: If the `file_timestamp_is_today` is False, it means that
-        the contextualization script did not run for whatever reason today.
-        Using this flag, logic should decide what to do in this case.
-        """
-        end = timezone.now()
-        start = end - timezone.timedelta(days=day_interval.value)
-
-        repositories = organization.repository_set.all()
-
-        anomaly_insights_and_risks, file_timestamp = cls.get_anomaly_insights_and_risks(
-            organization, repositories, day_interval
-        )
-        last_updated = datetime.fromtimestamp(file_timestamp, tz=timezone.utc)
-        return {
-            "last_updated": last_updated,
-            "updated_today": end <= last_updated,
-            "codebase_health": cls.get_codebase_health(
-                organization, start.date(), end.date()
+    def __init__(self, *args, **kwargs):
+        self.user = kwargs.pop("user")
+        initial = kwargs.setdefault("initial", {})
+        initial.setdefault(
+            "name",
+            get_adapter().generate_authenticator_name(
+                self.user, Authenticator.Type.WEBAUTHN
             ),
-            "percentage_ai": cls.get_percentage_ai(organization, start, end),
-            "anomaly_insights_and_risks": anomaly_insights_and_risks,
-            "data_sets_used": cls.get_data_sets_used(organization),
-        }
-
-    @staticmethod
-    def get_organization_commits(
-        organization: Organization,
-        start: datetime,
-        end: datetime,
-    ):
-        return RepositoryCommit.objects.filter(
-            repository__organization=organization,
-            created_by__range=(start, end),
         )
+        super().__init__(*args, **kwargs)
 
-    @staticmethod
-    def get_codebase_health(organization: Organization, start: date, end: date):
-        score_widget = SemaScoreWidget(organization)
-        chart_score, _, _ = score_widget.get_charts(start, end)
-        return score_widget.get_score(chart_score)
+    def clean_name(self):
+        """
+        We don't want to make `name` a required field, as the WebAuthn
+        ceremony happens before posting the resulting credential, and we don't
+        want to reject a valid credential because of a missing name -- it might
+        be resident already. So, gracefully plug in a name.
+        """
+        name = self.cleaned_data["name"]
+        if not name:
+            name = get_adapter().generate_authenticator_name(
+                self.user, Authenticator.Type.WEBAUTHN
+            )
+        return name
 
-    @staticmethod
-    def get_percentage_ai(organization: Organization, start: datetime, end: datetime):
-        service = AICompositionService(organization)
-        cumulative_charts, daily_charts = service.get_charts(start, end)
-        ai_composition = service.get_composition(cumulative_charts)
+    def clean(self):
+        cleaned_data = super().clean()
+        credential = cleaned_data.get("credential")
+        if credential:
+            # Explicitly parse JSON payload -- otherwise, register_complete()
+            # crashes with some random TypeError and we don't want to do
+            # Pokemon-style exception handling.
+            auth.parse_registration_response(credential)
+            auth.complete_registration(credential)
+        return cleaned_data
 
-        return next(
-            (
-                item
-                for item in ai_composition
-                if item["label"] == AITypeChoices.OVERALL.label
+
+class AddWebAuthnForm(_BaseAddWebAuthnForm):
+    if app_settings.PASSKEY_LOGIN_ENABLED:
+        passwordless = forms.BooleanField(
+            label=_("Passwordless"),
+            required=False,
+            help_text=_(
+                "Enabling passwordless operation allows you to sign in using just this key, but imposes additional requirements such as biometrics or PIN protection."
             ),
-            None,
         )
 
-    @classmethod
-    def get_anomaly_insights_and_risks(
-        cls,
-        organization: Organization,
-        repositories: QuerySet[Repository],
-        day_interval: ContextualizationDayInterval,
-    ):
-        data, file_timestamp = ContextualizationService.load_output_data(
-            organization,
-            ContextualizationService.OUTPUT_FILENAME_COMBINED_ANOMALY_INSIGHTS,
-            day_interval=day_interval,
+
+class SignupWebAuthnForm(_BaseAddWebAuthnForm):
+    pass
+
+
+class AuthenticateWebAuthnForm(forms.Form):
+    credential = forms.JSONField(required=True, widget=forms.HiddenInput)
+    reauthenticated = False
+    passwordless = False
+
+    def __init__(self, *args, **kwargs):
+        self.user = kwargs.pop("user")
+        super().__init__(*args, **kwargs)
+
+    def clean_credential(self):
+        credential = self.cleaned_data["credential"]
+        # Explicitly parse JSON payload -- otherwise, authenticate_complete()
+        # crashes with some random TypeError and we don't want to do
+        # Pokemon-style exception handling.
+        auth.parse_authentication_response(credential)
+        user = self.user
+        if user is None:
+            user = auth.extract_user_from_response(credential)
+        clear_rl = check_rate_limit(user)
+        authenticator = auth.complete_authentication(user, credential)
+        clear_rl()
+        return authenticator
+
+    def save(self):
+        authenticator = self.cleaned_data["credential"]
+        post_authentication(
+            context.request,
+            authenticator,
+            reauthenticated=self.reauthenticated,
+            passwordless=self.passwordless,
         )
-        return cls.format_anomaly_insights_and_risks(data, repositories), file_timestamp
 
-    @classmethod
-    def format_anomaly_insights_and_risks(
-        cls, data: dict, repositories: QuerySet[Repository]
-    ):
-        formatted_anomaly_insights_and_risks = {
-            cls.ATTENTION_LEVEL_CEO: [],
-            cls.ATTENTION_LEVEL_CEO_OR_CPO: [],
-            cls.ATTENTION_LEVEL_DIRECTOR_OR_MANAGER: [],
-            cls.ATTENTION_LEVEL_TEAM_LEAD: [],
-        }
 
-        repository_public_id_map = {repo.public_id(): repo for repo in repositories}
+class LoginWebAuthnForm(AuthenticateWebAuthnForm):
+    reauthenticated = False
+    passwordless = True
 
-        for anomaly_insight in data.get("anomaly_insights", []):
-            attention_level = AggregatedMessageService.ATTENTION_LEVELS_MAP.get(
-                anomaly_insight["significance_score"]
-            )
-            if not attention_level:
-                continue
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, user=None, **kwargs)
 
-            formatted_anomaly_insights_and_risks[attention_level].append(
-                {
-                    "type": "anomaly",
-                    **cls.replace_insight_repo_public_id_with_full_name(
-                        anomaly_insight, repository_public_id_map
-                    ),
-                }
-            )
 
-        for risk_insight in data.get("risk_insights", []):
-            attention_level = AggregatedMessageService.ATTENTION_LEVELS_MAP.get(
-                risk_insight["significance_score"]
-            )
-            if not attention_level:
-                continue
+class ReauthenticateWebAuthnForm(AuthenticateWebAuthnForm):
+    reauthenticated = True
+    passwordless = False
 
-            formatted_anomaly_insights_and_risks[attention_level].append(
-                {
-                    "type": "risk",
-                    **cls.replace_insight_repo_public_id_with_full_name(
-                        risk_insight, repository_public_id_map
-                    ),
-                }
-            )
 
-        return formatted_anomaly_insights_and_risks
+class EditWebAuthnForm(forms.Form):
+    name = forms.CharField(required=True)
 
-    @staticmethod
-    def replace_insight_repo_public_id_with_full_name(
-        insight: dict, repository_public_id_map: dict
-    ):
-        repository_public_id = insight["repo"]
-        repository = repository_public_id_map[insight["repo"]]
-        return {
-            key: (
-                value.replace(repository_public_id, repository.full_name())
-                if isinstance(value, str) and key != "repo"
-                else value
-            )
-            for key, value in insight.items()
-        }
+    def __init__(self, *args, **kwargs):
+        self.instance = kwargs.pop("instance")
+        initial = kwargs.setdefault("initial", {})
+        initial.setdefault("name", self.instance.wrap().name)
+        super().__init__(*args, **kwargs)
 
-    @staticmethod
-    def get_data_sets_used(organization: Organization):
-        return ConnectedIntegrationsService.get_connected_integrations_names(
-            organization, use_display_names=True
+    def save(self) -> Authenticator:
+        flows.rename_authenticator(
+            context.request, self.instance, self.cleaned_data["name"]
         )
+        return self.instance
 
