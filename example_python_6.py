@@ -1,61 +1,178 @@
-import json
-import logging
+from unittest.mock import patch
 
-from cto_tool import settings
-from django.core.mail import send_mail
-from django.core.mail import send_mass_mail
-from django.template.loader import render_to_string
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.test import Client
 from django.urls import reverse
-from mvp.utils import traceback_on_debug
-from sentry_sdk import capture_exception, capture_message, push_scope
 
-logger = logging.getLogger(__name__)
+import pytest
+
+from allauth.account.models import EmailAddress
 
 
-class EmailService:
-    # TODO refactor this to reduce code duplication
+@pytest.fixture(autouse=True)
+def email_verification_settings(settings):
+    settings.ACCOUNT_EMAIL_VERIFICATION_BY_CODE_ENABLED = True
+    settings.ACCOUNT_EMAIL_VERIFICATION = "mandatory"
+    settings.ACCOUNT_AUTHENTICATION_METHOD = "email"
+    return settings
 
-    @staticmethod
-    def send_email(
-        subject,
-        message,
-        from_email,
-        recipient_list,
-        auth_user=None,
-        auth_password=None,
-        connection=None,
-        html_message=None,
-    ):
-        if not recipient_list:
-            with push_scope() as scope:
-                scope.set_extra("subject", subject)
-                scope.set_extra("message", message)
-                scope.set_extra("from_email", from_email)
-            error_message = "failed to send emails. Empty recipient list"
-            capture_message(error_message)
-            logger.error(error_message)
 
-        try:
-            send_mail(
-                subject,
-                message,
-                from_email,
-                recipient_list,
-                auth_user=auth_user,
-                auth_password=auth_password,
-                connection=connection,
-                html_message=html_message,
-                fail_silently=False,
+@pytest.mark.parametrize(
+    "query,expected_url",
+    [
+        ("", settings.LOGIN_REDIRECT_URL),
+        ("?next=/foo", "/foo"),
+    ],
+)
+def test_signup(
+    client,
+    db,
+    settings,
+    password_factory,
+    get_last_email_verification_code,
+    query,
+    expected_url,
+    mailoutbox,
+):
+    password = password_factory()
+    resp = client.post(
+        reverse("account_signup") + query,
+        {
+            "username": "johndoe",
+            "email": "john@example.com",
+            "password1": password,
+            "password2": password,
+        },
+    )
+    assert get_user_model().objects.filter(username="johndoe").count() == 1
+    code = get_last_email_verification_code(client, mailoutbox)
+    assert resp.status_code == 302
+    assert resp["location"] == reverse("account_email_verification_sent")
+    resp = client.get(reverse("account_email_verification_sent"))
+    assert resp.status_code == 200
+    resp = client.post(reverse("account_email_verification_sent"), data={"code": code})
+    assert resp.status_code == 302
+    assert resp["location"] == expected_url
+
+
+def test_signup_prevent_enumeration(
+    client, db, settings, password_factory, user, mailoutbox
+):
+    password = password_factory()
+    resp = client.post(
+        reverse("account_signup"),
+        {
+            "username": "johndoe",
+            "email": user.email,
+            "password1": password,
+            "password2": password,
+        },
+    )
+    assert resp.status_code == 302
+    assert resp["location"] == reverse("account_email_verification_sent")
+    assert not get_user_model().objects.filter(username="johndoe").exists()
+    assert mailoutbox[0].subject == "[example.com] Account Already Exists"
+    resp = client.get(reverse("account_email_verification_sent"))
+    assert resp.status_code == 200
+    resp = client.post(reverse("account_email_verification_sent"), data={"code": ""})
+    assert resp.status_code == 200
+    assert resp.context["form"].errors == {"code": ["This field is required."]}
+    resp = client.post(reverse("account_email_verification_sent"), data={"code": "123"})
+    assert resp.status_code == 200
+    assert resp.context["form"].errors == {"code": ["Incorrect code."]}
+    # Max attempts
+    resp = client.post(reverse("account_email_verification_sent"), data={"code": "456"})
+    assert resp.status_code == 302
+    assert resp["location"] == reverse("account_login")
+
+
+@pytest.mark.parametrize("change_email", (False, True))
+def test_add_or_change_email(
+    auth_client,
+    user,
+    get_last_email_verification_code,
+    change_email,
+    settings,
+    mailoutbox,
+):
+    settings.ACCOUNT_CHANGE_EMAIL = change_email
+    email = "additional@email.org"
+    assert EmailAddress.objects.filter(user=user).count() == 1
+    with patch("allauth.account.signals.email_added") as email_added_signal:
+        with patch("allauth.account.signals.email_changed") as email_changed_signal:
+            resp = auth_client.post(
+                reverse("account_email"), {"action_add": "", "email": email}
             )
-        except Exception as e:
-            with push_scope() as scope:
-                scope.set_extra("subject", subject)
-                scope.set_extra("message", message)
-                scope.set_extra("from_email", from_email)
-                scope.set_extra("recipient_list", json.dumps(recipient_list))
-            traceback_on_debug()
-            capture_exception(e)
-            logger.error(f"failed to send emails to {recipient_list}")
-            return False
+            assert resp["location"] == reverse("account_email_verification_sent")
+            assert not email_added_signal.send.called
+            assert not email_changed_signal.send.called
+    assert EmailAddress.objects.filter(email=email).count() == 0
+    code = get_last_email_verification_code(auth_client, mailoutbox)
+    resp = auth_client.get(reverse("account_email_verification_sent"))
+    assert resp.status_code == 200
+    with patch("allauth.account.signals.email_added") as email_added_signal:
+        with patch("allauth.account.signals.email_changed") as email_changed_signal:
+            with patch(
+                "allauth.account.signals.email_confirmed"
+            ) as email_confirmed_signal:
+                resp = auth_client.post(
+                    reverse("account_email_verification_sent"), data={"code": code}
+                )
+                assert resp.status_code == 302
+                assert resp["location"] == settings.LOGIN_REDIRECT_URL
+                assert email_added_signal.send.called
+                assert email_confirmed_signal.send.called
+                assert email_changed_signal.send.called == change_email
+    assert EmailAddress.objects.filter(email=email, verified=True).count() == 1
+    assert EmailAddress.objects.filter(user=user).count() == (1 if change_email else 2)
 
-        return True
+
+def test_email_verification_login_redirect(
+    client, db, settings, password_factory, email_verification_settings
+):
+    password = password_factory()
+    resp = client.post(
+        reverse("account_signup"),
+        {
+            "username": "johndoe",
+            "email": "user@email.org",
+            "password1": password,
+            "password2": password,
+        },
+    )
+    assert resp.status_code == 302
+    assert resp["location"] == reverse("account_email_verification_sent")
+    resp = client.get(reverse("account_login"))
+    assert resp["location"] == reverse("account_email_verification_sent")
+
+
+def test_email_verification_rate_limits(
+    db,
+    user_password,
+    email_verification_settings,
+    settings,
+    user_factory,
+    password_factory,
+    enable_cache,
+):
+    settings.ACCOUNT_RATE_LIMITS = {"confirm_email": "1/m/key"}
+    email = "user@email.org"
+    user_factory(email=email, email_verified=False, password=user_password)
+    for attempt in range(2):
+        resp = Client().post(
+            reverse("account_login"),
+            {
+                "login": email,
+                "password": user_password,
+            },
+        )
+        if attempt == 0:
+            assert resp.status_code == 302
+            assert resp["location"] == reverse("account_email_verification_sent")
+        else:
+            assert resp.status_code == 200
+            assert resp.context["form"].errors == {
+                "__all__": ["Too many failed login attempts. Try again later."]
+            }
+
