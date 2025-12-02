@@ -34,6 +34,8 @@ def settings_check(app_configs, **kwargs):
             account_settings.EMAIL_VERIFICATION
             != account_settings.EmailVerificationMethod.MANDATORY
         ):
+            import ipdb;
+            ipdb.set_trace()
             ret.append(
                 Critical(
                     msg="MFA_PASSKEY_SIGNUP_ENABLED requires ACCOUNT_EMAIL_VERIFICATION = 'mandatory'"
