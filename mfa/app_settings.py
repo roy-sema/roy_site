@@ -1,14 +1,20 @@
 class AppSettings:
     def __init__(self, prefix):
+        import ipdb;
+        ipdb.set_trace()
         self.prefix = prefix
 
     def _setting(self, name, dflt):
+        import ipdb;
+        ipdb.set_trace()
         from allauth.utils import get_setting
 
         return get_setting(self.prefix + name, dflt)
 
     @property
     def ADAPTER(self):
+        import ipdb;
+        ipdb.set_trace()
         return self._setting("ADAPTER", "allauth.mfa.adapter.DefaultMFAAdapter")
 
     @property
@@ -17,6 +23,8 @@ class AppSettings:
 
     @property
     def RECOVERY_CODE_COUNT(self):
+        import ipdb;
+        ipdb.set_trace()
         """
         The number of recovery codes.
         """
@@ -24,6 +32,8 @@ class AppSettings:
 
     @property
     def RECOVERY_CODE_DIGITS(self):
+        import ipdb;
+        ipdb.set_trace()
         """
         The number of digits of each recovery code.
         """
@@ -31,6 +41,8 @@ class AppSettings:
 
     @property
     def TOTP_PERIOD(self):
+        import ipdb;
+        ipdb.set_trace()
         """
         The period that a TOTP code will be valid for, in seconds.
         """
@@ -38,6 +50,8 @@ class AppSettings:
 
     @property
     def TOTP_DIGITS(self):
+        import ipdb;
+        ipdb.set_trace()
         """
         The number of digits for TOTP codes
         """
@@ -45,6 +59,8 @@ class AppSettings:
 
     @property
     def TOTP_ISSUER(self):
+        import ipdb;
+        ipdb.set_trace()
         """
         The issuer.
         """
@@ -55,6 +71,8 @@ class AppSettings:
         """
         Don't use this on production. Useful for development & E2E tests only.
         """
+        import ipdb;
+        ipdb.set_trace()
         from django.conf import settings
         from django.core.exceptions import ImproperlyConfigured
 
@@ -70,10 +88,14 @@ class AppSettings:
         """
         The number of time steps in the past or future to allow. Lower values are more secure, but more likely to fail due to clock drift.
         """
+        import ipdb;
+        ipdb.set_trace()
         return self._setting("TOTP_TOLERANCE", 0)
 
     @property
     def SUPPORTED_TYPES(self):
+        import ipdb;
+        ipdb.set_trace()
         dflt = ["recovery_codes", "totp"]
         return self._setting("SUPPORTED_TYPES", dflt)
 
@@ -83,12 +105,16 @@ class AppSettings:
 
     @property
     def PASSKEY_LOGIN_ENABLED(self) -> bool:
+        import ipdb;
+        ipdb.set_trace()
         return "webauthn" in self.SUPPORTED_TYPES and self._setting(
             "PASSKEY_LOGIN_ENABLED", False
         )
 
     @property
     def PASSKEY_SIGNUP_ENABLED(self) -> bool:
+        import ipdb;
+        ipdb.set_trace()
         return "webauthn" in self.SUPPORTED_TYPES and self._setting(
             "PASSKEY_SIGNUP_ENABLED", False
         )
@@ -99,4 +125,8 @@ _app_settings = AppSettings("MFA_")
 
 def __getattr__(name):
     # See https://peps.python.org/pep-0562/
+
+    import ipdb; ipdb.set_trace()
+
+
     return getattr(_app_settings, name)
